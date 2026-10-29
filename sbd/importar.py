@@ -210,7 +210,7 @@ def nombre_columna(cabecera, i):
 
 
 # ------------------------------------------------------------- importar
-def importar(db, tabla, cabecera, filas):
+def importar(db, tabla, cabecera, filas, session=None, label=None):
     """Mete las filas en la tabla (creándola si no existe). Devuelve un Result."""
     if not cabecera:
         raise SBDError("el fichero no tiene cabecera con los nombres de las columnas")
@@ -223,7 +223,8 @@ def importar(db, tabla, cabecera, filas):
     creada = tabla not in db.tables
     propia = not db.in_transaction
     if propia:
-        db.run_statement(Begin())
+        db.run_statement(Begin(), session=session, label=label)
+    marca = len(db._undo)
     try:
         if creada:
             if tabla in db.views:
@@ -236,7 +237,7 @@ def importar(db, tabla, cabecera, filas):
                 lineas.append(f"{quote_ident(c)} {TYPE_NAMES[t]}")
             orden = f"crear tabla {quote_ident(tabla)} {{\n  " + '\n  '.join(lineas) + "\n}"
             for stmt in Parser(orden).parse_script():
-                db.run_statement(stmt)
+                db.run_statement(stmt, session=session, label=label)
         t = db.table(tabla)
         por_nombre = {nombre_columna(c.name, 0): c.name for c in t.columns}
         destino, sobran = [], []
@@ -253,12 +254,15 @@ def importar(db, tabla, cabecera, filas):
         tipos = [t.column(c).type for c in destino]
         valores = [[Literal(normalizar(v, tipo)) for v, tipo in zip(f, tipos)] for f in filas]
         if valores:
-            db.run_statement(Insert(tabla, destino, valores))
+            db.run_statement(Insert(tabla, destino, valores), session=session, label=label)
         if propia:
-            db.run_statement(Commit())
+            db.run_statement(Commit(), session=session, label=label)
     except BaseException:
         if propia:
-            db.run_statement(Rollback())
+            if db.in_transaction:
+                db.run_statement(Rollback(), session=session, label=label)
+        elif db.in_transaction and db.owner == session:
+            db._undo_to(marca)
         raise
     n = len(filas)
     nota = f" (tabla {tabla} creada con {len(columnas)} columnas)" if creada else ''
@@ -275,9 +279,9 @@ def leer_fichero(nombre, datos):
     return leer_csv(leer_texto(datos))
 
 
-def importar_fichero(db, ruta, tabla):
+def importar_fichero(db, ruta, tabla, session=None, label=None):
     if not os.path.exists(ruta):
         raise SBDError(f"no existe el fichero {ruta}")
     with open(ruta, 'rb') as f:
         cabecera, filas = leer_fichero(ruta, f.read())
-    return importar(db, tabla, cabecera, filas)
+    return importar(db, tabla, cabecera, filas, session=session, label=label)

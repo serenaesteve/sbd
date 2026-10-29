@@ -25,9 +25,13 @@ class Cerrojo:
                 self._f.seek(0)
                 msvcrt.locking(self._f.fileno(), msvcrt.LK_NBLCK, 1)
         except OSError:
-            self._f.seek(0)
-            dueño = self._f.read().strip() or 'otro proceso'
-            self._f.close()
+            try:
+                self._f.seek(0)
+                dueño = self._f.read().strip() or 'otro proceso'
+            except OSError:  # Windows no permite leer el byte bloqueado por otro proceso.
+                dueño = 'otro proceso'
+            finally:
+                self._f.close()
             raise SBDError(f"{que} ya está abierta en otro programa de SBD ({dueño}). "
                            "Ciérralo o sigue trabajando desde ese programa") from None
         self._f.seek(0)

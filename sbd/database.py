@@ -92,6 +92,7 @@ class Database:
         self.in_transaction = False
         self.loading = False
         self._undo = None      # [(función que deshace, cambio para el diario o None)]
+        self._quota_marks = []  # posiciones de cambios que requieren revalidar la cuota al confirmar
         self.owner = None      # sesión dueña de la transacción abierta
         self.owner_label = None
         self.last_activity = 0.0
@@ -99,6 +100,8 @@ class Database:
         self.generation = 0
         self._snapshot_bytes = 0
         self._journal_bytes = 0
+        self._broken = False
+        self.validate_write = None
         self._lock = None
         self.time_limit = None  # segundos que puede durar una orden (lo fija el servidor)
         if self.path:
@@ -164,7 +167,7 @@ class Database:
             self._undo = None
             self.owner = self.owner_label = None
         if self._lock is not None:
-            if self._journal_bytes:
+            if self._journal_bytes and not self._broken:
                 self._save()  # al cerrar se compacta: queda un único fichero
             self._lock.soltar()
             self._lock = None
@@ -200,6 +203,8 @@ class Database:
     # ========================================================= transacciones
     def run_statement(self, stmt, params=(), session=None, label=None):
         """Ejecuta una orden ya analizada. «session» identifica a quién pertenece la transacción."""
+        if self._broken:
+            raise SBDError('el estado del diario es incierto: cierra y vuelve a abrir la base')
         if session in self._expired:
             self._expired.discard(session)
             raise SBDError("tu transacción llevaba demasiado tiempo sin usarse y se ha deshecho: "
@@ -216,21 +221,32 @@ class Database:
                            "usa sbd.servidor('datos') o la consola, no un fichero suelto")
         if isinstance(stmt, Import):
             from .importar import importar_fichero
-            return importar_fichero(self, stmt.path, stmt.table)
+            return importar_fichero(self, stmt.path, stmt.table, session=session, label=label)
         if isinstance(stmt, Begin):
             if self.in_transaction:
                 raise SBDError("ya hay una transacción abierta: termina con «confirmar» o «deshacer»")
             self.in_transaction = True
             self.owner, self.owner_label = session, label
             self._undo = []
+            self._quota_marks = []
             return Result(message='Transacción abierta: los cambios no se guardan hasta «confirmar»')
         if isinstance(stmt, Commit):
             if not self.in_transaction:
                 raise SBDError("no hay ninguna transacción en curso")
-            entries, self._undo = self._undo, None
+            try:
+                if self.validate_write and self._undo:
+                    self.validate_write(self)
+                self._persist(self._undo)
+            except BaseException:
+                self._undo_to(0)
+                self._undo = None
+                self.in_transaction = False
+                self.owner = self.owner_label = None
+                raise
+            self._undo = None
+            self._quota_marks = []
             self.in_transaction = False
             self.owner = self.owner_label = None
-            self._persist(entries)
             return Result(message='Cambios confirmados y guardados')
         if isinstance(stmt, Rollback):
             if not self.in_transaction:
@@ -247,6 +263,12 @@ class Database:
         mark = len(self._undo)
         try:
             result = Executor(self, params, self.time_limit).execute(stmt)
+            if self.validate_write and len(self._undo) > mark:
+                self.validate_write(self)
+                if not autocommit:
+                    self._quota_marks.append(len(self._undo))
+            if autocommit:
+                self._persist(self._undo)
         except BaseException:
             # Una orden fallida no deja cambios a medias (la transacción sigue abierta).
             self._undo_to(mark)
@@ -254,8 +276,7 @@ class Database:
                 self._undo = None
             raise
         if autocommit:
-            entries, self._undo = self._undo, None
-            self._persist(entries)
+            self._undo = None
         return result
 
     def _log(self, undo, redo=None):
@@ -265,6 +286,7 @@ class Database:
     def _undo_to(self, mark):
         while len(self._undo) > mark:
             self._undo.pop()[0]()
+        self._quota_marks = [pos for pos in self._quota_marks if pos <= mark]
 
     def _schema_checkpoint(self):
         tables, views, owners = dict(self.tables), dict(self.views), dict(self.index_owner)
@@ -664,23 +686,35 @@ class Database:
                 ops.append([r[0], r[1], r[2], [r[3][c] for c in self.tables[r[1]].colnames]])
         line = (json.dumps({'g': self.generation, 'ops': ops}, ensure_ascii=False,
                            default=json_por_defecto) + '\n').encode('utf-8')
-        with open(self.journal_path, 'ab') as f:
-            f.write(line)
-            f.flush()
-            os.fsync(f.fileno())
+        previous = os.path.getsize(self.journal_path) if os.path.exists(self.journal_path) else 0
+        try:
+            with open(self.journal_path, 'ab') as f:
+                f.write(line)
+                f.flush()
+                os.fsync(f.fileno())
+        except OSError:
+            try:
+                with open(self.journal_path, 'a+b') as f:
+                    f.truncate(previous)
+                    f.flush()
+                    os.fsync(f.fileno())
+            except OSError:
+                self._broken = True
+                raise SBDError('no se pudo revertir el diario; la confirmación es incierta: '
+                               'cierra y vuelve a abrir la base') from None
+            raise
         self._journal_bytes += len(line)
         if self._journal_bytes > COMPACT_MIN_BYTES and self._journal_bytes > self._snapshot_bytes:
-            self._save()
+            try:
+                self._save()
+            except OSError:
+                pass  # la confirmación ya está en el diario; se compactará después
 
-    def _save(self):
-        """Foto completa y diario vacío."""
-        if not self.path:
-            return
-        self.generation += 1
-        data = {
+    def _snapshot_data(self, generation=None):
+        return {
             'format': FILE_FORMAT,
             'version': FILE_VERSION,
-            'generacion': self.generation,
+            'generacion': self.generation + 1 if generation is None else generation,
             'schema': self.schema_sbd(),
             'data': {
                 name: {
@@ -691,16 +725,27 @@ class Database:
                 for name, t in self.tables.items()
             },
         }
+    def _save(self):
+        """Foto completa y diario vacío."""
+        if not self.path:
+            return
+        data = self._snapshot_data()
         tmp = self.path + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, default=json_por_defecto)
             f.flush()
             os.fsync(f.fileno())
+        tamaño = os.path.getsize(tmp)
         os.replace(tmp, self.path)
-        self._snapshot_bytes = os.path.getsize(self.path)
-        if os.path.exists(self.journal_path):
-            os.remove(self.journal_path)
-        self._journal_bytes = 0
+        self.generation = data['generacion']
+        self._snapshot_bytes = tamaño
+        try:
+            if os.path.exists(self.journal_path):
+                os.remove(self.journal_path)
+            self._journal_bytes = 0
+        except OSError:
+            # El diario antiguo se ignora por su generación y puede retirarse después.
+            pass
 
     def _load(self):
         try:

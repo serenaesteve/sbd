@@ -404,7 +404,9 @@ class Nucleo:
             sesion._permitir(Import(nombre_fichero, tabla))
             datos = base64.b64decode(contenido, validate=True)
             cabecera, filas = leer_fichero(nombre_fichero, datos)
-            r = importar(sesion.db, tabla, cabecera, filas)
+            db = sesion.db
+            with sesion.limitar(db):
+                r = importar(db, tabla, cabecera, filas, session=sesion.id, label=sesion.etiqueta)
             self.servidor.auditar(sesion.etiqueta, base, orden, r.message)
         except (SBDError, ValueError) as e:
             mensaje = str(e) if isinstance(e, SBDError) else "el fichero no ha llegado bien; vuelve a subirlo"
@@ -459,6 +461,10 @@ class Nucleo:
 
 
 class Handler(BaseHTTPRequestHandler):
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(15)
+
     server_version = f'SBD/{__version__}'
     protocol_version = 'HTTP/1.1'
 
@@ -538,13 +544,41 @@ class Handler(BaseHTTPRequestHandler):
         if not (self.headers.get('Content-Type') or '').startswith('application/json'):
             # Exigir JSON obliga al navegador a pedir permiso (CORS): otra web no puede enviar órdenes.
             raise ApiError('se esperaba Content-Type: application/json', HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
-        length = int(self.headers.get('Content-Length') or 0)
+        if self.headers.get('Transfer-Encoding'):
+            raise ApiError('Transfer-Encoding no está admitido')
+        try:
+            length = int(self.headers.get('Content-Length') or 0)
+        except ValueError:
+            raise ApiError('Content-Length no es válido') from None
+        if length < 0:
+            raise ApiError('Content-Length no es válido')
         if length > MAX_BODY:
             raise ApiError('la petición es demasiado grande (máximo 50 MB)', HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
         try:
-            cuerpo = json.loads(self.rfile.read(length) or b'{}')
+            # Un plazo total evita que un cliente lo prolongue enviando un byte cada poco.
+            fin = time.monotonic() + 15
+            partes, restante = [], length
+            while restante:
+                plazo = fin - time.monotonic()
+                if plazo <= 0:
+                    raise TimeoutError
+                self.connection.settimeout(plazo)
+                parte = self.rfile.read1(min(restante, 65536))
+                if not parte:
+                    break
+                partes.append(parte)
+                restante -= len(parte)
+            datos = b''.join(partes)
+            if len(datos) != length:
+                raise ApiError('cuerpo incompleto')
+            cuerpo = json.loads(datos or b'{}')
+        except TimeoutError:
+            self.close_connection = True
+            raise ApiError('tiempo de lectura agotado', HTTPStatus.REQUEST_TIMEOUT) from None
         except ValueError:
             raise ApiError('el cuerpo no es JSON válido') from None
+        finally:
+            self.connection.settimeout(15)
         if not isinstance(cuerpo, dict):
             raise ApiError('el cuerpo tiene que ser un objeto JSON')
         self._cuerpo = cuerpo
@@ -561,6 +595,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if not self.host_allowed():
                 raise ApiError('Host no permitido', HTTPStatus.FORBIDDEN, 'host')
+            if self.command == 'POST':
+                self.leer_cuerpo()  # nunca esperar a la red con el cerrojo del motor adquirido
             limite = time.monotonic() + ESPERA_OCUPADA
             while True:
                 try:
@@ -582,9 +618,16 @@ class Handler(BaseHTTPRequestHandler):
                 if isinstance(datos, dict) and datos.get('error') and urlparse(self.path).path.startswith('/api/v1/'):
                     status = tipo_de_error_por_nombre(datos.get('tipo'))
                 self.send_json(datos, status, {**extra, **cabeceras})
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self.close_connection = True
         except (ApiError, SBDError) as e:
+            if self.command == 'POST' and self._cuerpo is None:
+                self.close_connection = True
             tipo, status = tipo_de_error(e)
-            self.send_json({'error': str(e), 'tipo': tipo, 'entrar': tipo == 'entrar'}, status, extra)
+            try:
+                self.send_json({'error': str(e), 'tipo': tipo, 'entrar': tipo == 'entrar'}, status, extra)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                self.close_connection = True
         except Exception:
             print(f"✕ error interno en {self.command} {self.path}:\n{traceback.format_exc()}", file=sys.stderr, flush=True)
             self.send_json({'error': 'error interno del servidor (está anotado en su registro)', 'tipo': 'interno'},
@@ -695,6 +738,8 @@ class ServidorHTTP(ThreadingHTTPServer):
                  dominios=()):
         super().__init__(address, Handler)
         self.nucleo = Nucleo(servidor, copias)
+        if any_host or dominios:
+            servidor.proteger_ultimo_usuario = True
         self.any_host = any_host
         self.dominios = {d.lower() for d in dominios}
         self.silencio = silencio

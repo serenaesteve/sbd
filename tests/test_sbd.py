@@ -625,7 +625,8 @@ class TestDinero(unittest.TestCase):
             sbd.Database.__init__(otra, ruta)
             self.assertEqual(otra.execute('buscar f mostrar importe').scalar(), Decimal('0.30'))
             otra.close()
-            self.assertEqual(sbd.conectar(ruta).execute('buscar f mostrar importe').scalar(), Decimal('0.30'))
+            with sbd.conectar(ruta) as abierta:
+                self.assertEqual(abierta.execute('buscar f mostrar importe').scalar(), Decimal('0.30'))
 
 
 class TestProduccion(unittest.TestCase):
@@ -769,7 +770,8 @@ class TestDisco(unittest.TestCase):
                 db2.execute('insertar en p (9, "demasiado largo")')
             db2.execute("borrar de p donde id = 1")
             db2.close()
-            self.assertEqual(rows(sbd.conectar(ruta), 'buscar h mostrar contar()'), [(1,)])
+            with sbd.conectar(ruta) as abierta:
+                self.assertEqual(rows(abierta, 'buscar h mostrar contar()'), [(1,)])
 
     def test_diario_guarda_solo_lo_que_cambia(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -782,7 +784,8 @@ class TestDisco(unittest.TestCase):
                 db.execute('insertar en t { v: ? }', [f'fila {i}'])
             db.execute('actualizar t poner v = "cambiada" donde id = 3  borrar de t donde id = 4')
             self.assertEqual(os.path.getsize(ruta), foto)  # la foto no se ha reescrito
-            self.assertEqual(sum(1 for _ in open(diario)), 52)
+            with open(diario) as fichero:
+                self.assertEqual(sum(1 for _ in fichero), 52)
             # otro proceso que abriera ahora vería foto + diario
             db._lock.soltar()
             vista = sbd.Database.__new__(sbd.Database)
@@ -792,7 +795,8 @@ class TestDisco(unittest.TestCase):
             self.assertEqual(vista.execute('insertar en t { v: "nueva" }').lastrowid, 51)
             vista.close()  # al cerrar se compacta
             self.assertFalse(os.path.exists(diario))
-            self.assertEqual(rows(sbd.conectar(ruta), 'buscar t mostrar contar()'), [(50,)])
+            with sbd.conectar(ruta) as abierta:
+                self.assertEqual(rows(abierta, 'buscar t mostrar contar()'), [(50,)])
 
     def test_diario_cortado_a_medias(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -806,7 +810,8 @@ class TestDisco(unittest.TestCase):
             self.assertEqual(rows(otra, 'buscar t mostrar v'), [('a',), ('b',)])
             otra.execute('insertar en t { v: "c" }')
             otra.close()
-            self.assertEqual(rows(sbd.conectar(ruta), 'buscar t mostrar v'), [('a',), ('b',), ('c',)])
+            with sbd.conectar(ruta) as abierta:
+                self.assertEqual(rows(abierta, 'buscar t mostrar v'), [('a',), ('b',), ('c',)])
 
 
 if __name__ == '__main__':

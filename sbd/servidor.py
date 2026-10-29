@@ -16,6 +16,8 @@ import re
 import secrets
 import shutil
 import time
+import tempfile
+from contextlib import contextmanager
 
 from .cerrojo import Cerrojo
 from .database import Database
@@ -23,9 +25,11 @@ from .parser import Parser
 from .errors import PermisoDenegado, SBDError
 from .nodes import (AlterTable, Begin, ChangePassword, ChangePermission, Commit, CopyDatabase, CreateApiKey, CreateIndex,
                     CreateTable, Explain, CreateDatabase, CreateUser, Describe, DropApiKey, DropDatabase, DropUser,
+                    Delete, DropTable, DropIndex, DropView,
                     Import, Insert, RecoverDatabase, Rollback, Select, RestoreBackup, ShowApiKeys, ShowBackups,
                     ShowDatabases, ShowHistory, ShowIndexes, ShowTables, ShowTrash, ShowUsers, Update, UseDatabase)
 from .result import Result
+from .values import json_por_defecto
 
 EXTENSION = '.base'
 _VALID_NAME = re.compile(r'[a-zñ_][a-z0-9ñ_]{0,62}\Z')
@@ -51,6 +55,7 @@ class Servidor:
     def __init__(self, directorio='datos', quien='Python', limite_segundos=None):
         self.limite_segundos = limite_segundos  # tope de duración de cada orden
         self.directorio = os.path.abspath(directorio)
+        self.proteger_ultimo_usuario = False
         os.makedirs(self.directorio, exist_ok=True)
         self.quien = quien
         self._cerrojo = Cerrojo(os.path.join(self.directorio, '.sbd.lock'),
@@ -246,6 +251,22 @@ class Servidor:
         if self.memoria_mb() >= u['max_memoria_mb']:
             raise PermisoDenegado("el servidor está lleno ahora mismo: vuelve a intentarlo en un rato")
 
+    def comprobar_cuota_resultado(self, usuario, db, adicional=False):
+        """Comprueba el resultado antes de confirmarlo, incluyendo el diario pendiente."""
+        u = self.uso(usuario)
+        filas = sum(len(t.rows) for t in db.tables.values())
+        total_filas = u['filas'] + (filas if adicional else 0)
+        if total_filas > u['max_filas']:
+            raise PermisoDenegado('la operación superaría el máximo de filas de tu cuenta')
+        foto = len(json.dumps(db._snapshot_data(), ensure_ascii=False, default=json_por_defecto).encode('utf-8'))
+        pendientes = [r for _, r in (db._undo or ()) if r is not None]
+        diario = sum(len(json.dumps(r, ensure_ascii=False, default=json_por_defecto).encode('utf-8')) + 128
+                     for r in pendientes)
+        proyectado = max(foto + db._journal_bytes, db.bytes_on_disk + diario)
+        total_bytes = u['bytes'] + proyectado - (0 if adicional else db.bytes_on_disk)
+        if total_bytes > u['max_mb'] * 1024 * 1024:
+            raise PermisoDenegado('la operación superaría el máximo de espacio de tu cuenta')
+
     def soltar_inactivas(self, segundos):
         """Guarda y saca de la memoria las bases que nadie ha usado en un rato."""
         ahora = time.monotonic()
@@ -312,6 +333,8 @@ class Servidor:
     def borrar_usuario(self, nombre):
         if nombre not in self._usuarios:
             raise SBDError(f"no existe ningún usuario «{nombre}»")
+        if self.proteger_ultimo_usuario and len(self._usuarios) == 1:
+            raise SBDError('no se puede borrar el último usuario mientras el servidor está expuesto')
         if self._usuarios[nombre]['permiso'] == 'todo' and self._ultimo_con_todo(nombre) and len(self._usuarios) > 1:
             raise SBDError(f"{nombre} es el único usuario con permiso «todo»: dáselo antes a otro")
         del self._usuarios[nombre]
@@ -650,11 +673,60 @@ class Sesion:
 
     def ejecutar_orden(self, orden, params=(), texto=None):
         """Ejecuta una orden ya analizada; si cambia algo, la apunta en la auditoría."""
-        resultado = self._ejecutar_orden(orden, params)
+        db = self.servidor.abrir(self.base) if self._es_cuenta() and self.base else None
+        limitar = not isinstance(orden, (Delete, DropTable, DropIndex, DropView))
+        if isinstance(orden, Commit) and db:
+            limitar = bool(db._quota_marks)
+        with self.limitar(db, habilitado=limitar):
+            resultado = self._ejecutar_orden(orden, params)
         if texto is not None and not isinstance(orden, SIN_AUDITAR):
             base = getattr(orden, 'name', None) if isinstance(orden, (CreateDatabase, DropDatabase)) else self.base
             self.servidor.auditar(self.etiqueta, base, texto, resultado.message)
         return resultado
+
+    @contextmanager
+    def limitar(self, db, habilitado=True):
+        anterior = db.validate_write if db else None
+        if db and self._es_cuenta() and habilitado:
+            db.validate_write = lambda actual: self.servidor.comprobar_cuota_resultado(self.usuario['nombre'], actual)
+        try:
+            yield
+        finally:
+            if db:
+                db.validate_write = anterior
+
+    def _comprobar_nueva_copia(self, nombre):
+        if not self._es_cuenta():
+            return
+        try:
+            db = self.servidor.abrir(nombre)
+            self.servidor.comprobar_cuota_resultado(self.usuario['nombre'], db, adicional=True)
+        except BaseException:
+            db = self.servidor._abiertas.pop(nombre, None)
+            if db:
+                db.close()
+            for ruta in self.servidor._ficheros(nombre):
+                os.remove(ruta)
+            raise
+
+    def _comprobar_papelera(self, nombre):
+        if not self._es_cuenta():
+            return
+        copias = [e for e in self.servidor.papelera() if e[0] == nombre]
+        if not copias:
+            return  # recuperar dará el error habitual
+        origen = os.path.join(self.servidor.papelera_dir, copias[0][3])
+        with tempfile.TemporaryDirectory() as carpeta:
+            ruta = os.path.join(carpeta, 'copia.base')
+            shutil.copy2(origen, ruta)
+            diario = origen[:-len(EXTENSION)] + '.diario'
+            if os.path.exists(diario):
+                shutil.copy2(diario, os.path.join(carpeta, 'copia.diario'))
+            db = Database(ruta)
+            try:
+                self.servidor.comprobar_cuota_resultado(self.usuario['nombre'], db, adicional=True)
+            finally:
+                db.close()
 
     def _ejecutar_orden(self, orden, params=()):
         servidor = self.servidor
@@ -699,6 +771,7 @@ class Sesion:
         if isinstance(orden, CreateDatabase):
             creada = servidor.crear(orden.name, orden.if_not_exists)
             if creada:
+                self._comprobar_nueva_copia(orden.name)
                 self._apuntar(orden.name)
             if self.base is None or creada:
                 self.usar(orden.name)
@@ -723,6 +796,7 @@ class Sesion:
             orden = Import(os.path.join(self.directorio, orden.path), orden.table)
         if isinstance(orden, CopyDatabase):
             servidor.copiar(orden.name, orden.new_name)
+            self._comprobar_nueva_copia(orden.new_name)
             self._apuntar(orden.new_name)
             return Result(message=f"Base {orden.name} copiada como {orden.new_name}")
         if isinstance(orden, ShowBackups):
@@ -732,6 +806,7 @@ class Sesion:
             return Result(['día', 'base', 'bytes'], copias)
         if isinstance(orden, RestoreBackup):
             servidor.restaurar(orden.name, orden.day, orden.new_name)
+            self._comprobar_nueva_copia(orden.new_name or orden.name)
             self._apuntar(orden.new_name or orden.name)
             return Result(message=f"Base {orden.new_name or orden.name} restaurada desde la copia del {orden.day}")
         if isinstance(orden, ShowTrash):
@@ -739,6 +814,7 @@ class Sesion:
                      if not self._es_cuenta() or servidor.es_suya(self.usuario['nombre'], n, o_borrada=True)]
             return Result(['base', 'borrada', 'bytes'], filas)
         if isinstance(orden, RecoverDatabase):
+            self._comprobar_papelera(orden.name)
             cuando = servidor.recuperar(orden.name, orden.new_name)
             nombre = orden.new_name or orden.name
             self._apuntar(nombre)
