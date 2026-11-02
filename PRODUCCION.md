@@ -189,7 +189,7 @@ Todas las rutas de `/api/v1/` piden la cabecera `Authorization: Bearer sbd_…`.
 | `POST /api/v1/sesiones` | `{"base": "tienda"}` | `{"sesion": "api:…"}` |
 | `DELETE /api/v1/sesiones/<id>` | | `{"ok": true}`, y deshace lo que quedara sin confirmar |
 | `GET /api/v1/catalogo?base=tienda` | | tablas, columnas, vistas y bases, para autocompletar o generar código |
-| `GET /salud` | (sin clave) | `{"ok": true, "version": "3.1.1", "bases": 2}`, para el monitor |
+| `GET /salud` | (sin clave) | `{"ok": true, "version": "3.2.0", "bases": 2}`, para el monitor |
 | `GET /cliente/sbd.js` | (sin clave) | el cliente de JavaScript |
 
 En `ejecutar`, `orden` puede llevar varias órdenes seguidas. `base` y `sesion` son opcionales. Los parámetros solo pueden ser números, textos, `true`/`false` o `null`.

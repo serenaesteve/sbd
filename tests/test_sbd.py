@@ -1,6 +1,12 @@
 import os
+import shutil
+import signal
+import stat
+import subprocess
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import sbd
 from sbd import SBDError
@@ -807,6 +813,352 @@ class TestDisco(unittest.TestCase):
             otra.execute('insertar en t { v: "c" }')
             otra.close()
             self.assertEqual(rows(sbd.conectar(ruta), 'buscar t mostrar v'), [('a',), ('b',), ('c',)])
+
+
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+class TestCortes(unittest.TestCase):
+    """Lo que queda en disco si todo se para de golpe, y en qué orden se hace duradero cada paso."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.ruta = os.path.join(self.tmp, 'd.base')
+
+    def morir(self, cuerpo):
+        """Ejecuta el código en otro proceso, que termina con kill -9: sin cerrar ni compactar nada."""
+        codigo = ('import os, signal, sys\nimport sbd\ndb = sbd.conectar(sys.argv[1])\n' + cuerpo
+                  + '\nos.kill(os.getpid(), signal.SIGKILL)\n')
+        hecho = subprocess.run([sys.executable, '-c', codigo, self.ruta], env={**os.environ, 'PYTHONPATH': RAIZ},
+                               capture_output=True, text=True)
+        self.assertEqual(hecho.returncode, -signal.SIGKILL, hecho.stderr)
+
+    def contar(self, ruta=None):
+        db = sbd.conectar(ruta or self.ruta)
+        try:
+            return rows(db, 'buscar t mostrar contar()')[0][0]
+        finally:
+            db.close()
+
+    def test_kill_a_mitad_de_una_transaccion(self):
+        self.morir('db.execute("crear tabla t { id entero clave  n entero }")\n'
+                   'for i in range(5): db.execute("insertar en t { n: ? }", [i])\n'
+                   'db.execute("empezar")\n'
+                   'for i in range(45): db.execute("insertar en t { n: ? }", [i])')
+        self.assertEqual(self.contar(), 5)
+
+    def test_kill_justo_despues_de_confirmar(self):
+        self.morir('db.execute("crear tabla t { id entero clave  n entero }")\n'
+                   'db.execute("empezar")\n'
+                   'for i in range(3): db.execute("insertar en t { n: ? }", [i])\n'
+                   'db.execute("confirmar")')
+        self.assertEqual(self.contar(), 3)
+
+    def test_diario_cortado_en_cada_byte(self):
+        self.morir('db.execute("crear tabla t { id entero clave  n entero }")\n'
+                   'for k in range(4):\n'
+                   '    db.execute("empezar")\n'
+                   '    for j in range(3): db.execute("insertar en t { n: ? }", [k])\n'
+                   '    db.execute("confirmar")')
+        diario = self.ruta[:-len('.base')] + '.diario'
+        with open(self.ruta, 'rb') as f:
+            foto = f.read()
+        with open(diario, 'rb') as f:
+            contenido = f.read()
+        vistos = set()
+        otra = os.path.join(self.tmp, 'corte.base')
+        for corte in range(len(contenido) + 1):
+            for sobra in (otra, otra[:-len('.base')] + '.diario'):
+                if os.path.exists(sobra):
+                    os.remove(sobra)
+            with open(otra, 'wb') as f:
+                f.write(foto)
+            with open(otra[:-len('.base')] + '.diario', 'wb') as f:
+                f.write(contenido[:corte])
+            vistos.add(self.contar(otra))
+        self.assertEqual(vistos, {0, 3, 6, 9, 12})  # nunca una transacción a medias
+
+    def test_foto_nueva_con_el_diario_viejo_no_repite_cambios(self):
+        # El corte llegó después de renombrar la foto y antes de borrar el diario
+        db = sbd.conectar(self.ruta)
+        db.execute('crear tabla t { id entero clave  n entero }  insertar en t { n: 1 }  insertar en t { n: 2 }')
+        diario = self.ruta[:-len('.base')] + '.diario'
+        with open(diario, 'rb') as f:
+            viejo = f.read()
+        self.assertTrue(viejo)
+        db.close()  # compacta: foto nueva y sin diario
+        self.assertFalse(os.path.exists(diario))
+        with open(diario, 'wb') as f:
+            f.write(viejo)
+        self.assertEqual(self.contar(), 2)
+
+    def registrar_pasos(self):
+        """Apunta, en orden, los fsync (de fichero o de carpeta), los renombrados y los borrados."""
+        pasos = []
+        fsync, replace, remove = os.fsync, os.replace, os.remove
+
+        def f_fsync(fd):
+            pasos.append('fsync carpeta' if stat.S_ISDIR(os.fstat(fd).st_mode) else 'fsync fichero')
+            return fsync(fd)
+
+        def f_replace(a, b):
+            pasos.append(f'renombrar {os.path.basename(b)}')
+            return replace(a, b)
+
+        def f_remove(a):
+            pasos.append(f'borrar {os.path.basename(a)}')
+            return remove(a)
+
+        return pasos, mock.patch.multiple(os, fsync=f_fsync, replace=f_replace, remove=f_remove)
+
+    @unittest.skipIf(os.name == 'nt', 'en Windows las carpetas no se sincronizan')
+    def test_la_foto_es_segura_antes_de_borrar_el_diario(self):
+        db = sbd.conectar(self.ruta)
+        db.execute('crear tabla t { id entero clave  n entero }  insertar en t { n: 1 }')
+        pasos, parche = self.registrar_pasos()
+        with parche:
+            db._save()
+        self.assertEqual(pasos, ['fsync fichero', 'renombrar d.base', 'fsync carpeta', 'borrar d.diario'])
+        db.close()
+
+    @unittest.skipIf(os.name == 'nt', 'en Windows las carpetas no se sincronizan')
+    def test_el_diario_nuevo_se_apunta_en_la_carpeta_solo_la_primera_vez(self):
+        db = sbd.conectar(self.ruta)
+        db.execute('crear tabla t { id entero clave  n entero }')
+        pasos, parche = self.registrar_pasos()
+        with parche:
+            db.execute('insertar en t { n: 1 }')
+            self.assertEqual(pasos, ['fsync fichero', 'fsync carpeta'])
+            pasos.clear()
+            db.execute('insertar en t { n: 2 }')
+            self.assertEqual(pasos, ['fsync fichero'])
+        db.close()
+
+    @unittest.skipIf(os.name == 'nt', 'en Windows las carpetas no se sincronizan')
+    def test_usuarios_y_claves_llegan_al_disco_antes_de_renombrar(self):
+        srv = sbd.servidor(self.tmp)
+        pasos, parche = self.registrar_pasos()
+        with parche:
+            srv.crear_usuario('ana', 'una clave larga', 'leer')
+        self.assertEqual(pasos, ['fsync fichero', 'renombrar .usuarios', 'fsync carpeta'])
+        pasos.clear()
+        with parche:
+            srv.crear_clave_api('ana')
+        self.assertEqual(pasos, ['fsync fichero', 'renombrar .claves', 'fsync carpeta'])
+        srv.cerrar()
+
+
+
+class TestProcedimientos(unittest.TestCase):
+    TRANSFERIR = """crear procedimiento transferir(origen, destino, cantidad) {
+      actualizar cuentas poner saldo = saldo - :cantidad donde id = :origen
+      actualizar cuentas poner saldo = saldo + :cantidad donde id = :destino
+      buscar cuentas donde id en [:origen, :destino] ordenar id mostrar saldo
+    }"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.ruta = os.path.join(self.tmp, 'd.base')
+        self.db = sbd.conectar(self.ruta)
+        self.addCleanup(lambda: self.db.close())
+        self.db.execute('crear tabla cuentas { id entero clave  saldo entero comprobar saldo >= 0 }'
+                        '  insertar en cuentas (saldo) (100) (0)')
+
+    def saldos(self):
+        return [f[0] for f in rows(self.db, 'buscar cuentas ordenar id mostrar saldo')]
+
+    def test_crear_ejecutar_y_devolver_filas(self):
+        self.db.execute(self.TRANSFERIR)
+        self.assertEqual(rows(self.db, 'ejecutar transferir(1, 2, 30)'), [(70,), (30,)])
+        self.assertEqual(self.saldos(), [70, 30])
+
+    def test_los_valores_pueden_ser_expresiones_y_parametros(self):
+        self.db.execute(self.TRANSFERIR)
+        self.db.execute('ejecutar transferir(?, ?, 10 + ?)', [1, 2, 5])
+        self.assertEqual(self.saldos(), [85, 15])
+
+    def test_todo_o_nada_si_falla_una_orden(self):
+        self.db.execute(self.TRANSFERIR)
+        with self.assertRaises(SBDError):
+            self.db.execute('ejecutar transferir(2, 1, 30)')  # la cuenta 2 no tiene saldo
+        self.assertEqual(self.saldos(), [100, 0])
+        # Y el orden contrario: falla la segunda orden, después de cambiar la primera
+        self.db.execute('crear procedimiento mal(n) { actualizar cuentas poner saldo = :n donde id = 1  '
+                        'actualizar cuentas poner saldo = -1 donde id = 2 }')
+        with self.assertRaises(SBDError):
+            self.db.execute('ejecutar mal(5)')
+        self.assertEqual(self.saldos(), [100, 0])
+        self.db.close()
+        self.db = sbd.conectar(self.ruta)
+        self.assertEqual(self.saldos(), [100, 0])  # tampoco llegó al disco
+
+    def test_dentro_de_una_transaccion(self):
+        self.db.execute(self.TRANSFERIR)
+        self.db.execute('empezar')
+        self.db.execute('ejecutar transferir(1, 2, 10)')
+        with self.assertRaises(SBDError):
+            self.db.execute('ejecutar transferir(2, 1, 500)')
+        self.assertEqual(self.saldos(), [90, 10])  # solo se deshace la llamada que falló
+        self.db.execute('deshacer')
+        self.assertEqual(self.saldos(), [100, 0])
+
+    def test_sobrevive_al_reabrir_y_lo_que_hace_tambien(self):
+        self.db.execute(self.TRANSFERIR)
+        self.db.close()
+        self.db = sbd.conectar(self.ruta)
+        self.db.execute('ejecutar transferir(1, 2, 7)')
+        self.db.close()
+        self.db = sbd.conectar(self.ruta)
+        self.assertEqual(self.saldos(), [93, 7])
+        fila = rows(self.db, 'procedimientos')[0]
+        self.assertEqual(fila[:2], ('transferir', 'origen, destino, cantidad'))
+
+    def test_crearlo_o_borrarlo_en_una_transaccion_se_puede_deshacer(self):
+        self.db.execute('empezar')
+        self.db.execute(self.TRANSFERIR)
+        self.db.execute('deshacer')
+        self.assertEqual(rows(self.db, 'procedimientos'), [])
+        self.db.execute(self.TRANSFERIR)
+        self.db.execute('empezar  borrar procedimiento transferir  deshacer')
+        self.assertEqual(len(rows(self.db, 'procedimientos')), 1)
+        self.db.execute('borrar procedimiento transferir')
+        with self.assertRaises(SBDError):
+            self.db.execute('ejecutar transferir(1, 2, 3)')
+        self.db.execute('borrar procedimiento transferir si existe')
+
+    def test_un_parametro_no_se_confunde_con_una_columna_que_se_llama_igual(self):
+        self.db.execute('crear procedimiento fijar(saldo, id) { actualizar cuentas poner saldo = :saldo donde id = :id }')
+        self.db.execute('ejecutar fijar(55, 2)')
+        self.assertEqual(self.saldos(), [100, 55])
+
+    def test_un_procedimiento_puede_llamar_a_otro_pero_no_sin_fin(self):
+        self.db.execute(self.TRANSFERIR)
+        self.db.execute('crear procedimiento doble(a, b, n) { ejecutar transferir(:a, :b, :n)  ejecutar transferir(:a, :b, :n) }')
+        self.db.execute('ejecutar doble(1, 2, 5)')
+        self.assertEqual(self.saldos(), [90, 10])
+        self.db.execute('crear procedimiento sinfin() { actualizar cuentas poner saldo = 1 donde id = 1  ejecutar sinfin() }')
+        with self.assertRaises(SBDError) as ctx:
+            self.db.execute('ejecutar sinfin()')
+        self.assertIn('llamándose', str(ctx.exception))
+        self.assertEqual(self.saldos(), [90, 10])
+
+    def test_el_cuerpo_solo_admite_ordenes_de_datos(self):
+        for cuerpo in ['importar "/etc/passwd" en t', 'crear tabla x { id entero clave }', 'borrar tabla cuentas',
+                       'empezar', 'confirmar', 'deshacer', 'crear base x', 'usar x', 'usuarios', 'copias',
+                       'crear usuario x clave "una clave larga" puede todo', 'crear clave api para x',
+                       'borrar base x', 'historial', 'crear procedimiento y() { calcular 1 }']:
+            with self.assertRaises(SBDError, msg=cuerpo):
+                self.db.execute(f'crear procedimiento p() {{ {cuerpo} }}')
+
+    def test_errores_al_escribirlo(self):
+        for mal in ['crear procedimiento p() { }',                            # vacío
+                    'crear procedimiento p(a, a) { calcular :a }',            # parámetro repetido
+                    'crear procedimiento p(a) { calcular :b }',               # parámetro que no existe
+                    'crear procedimiento p(a) { calcular ? }',                # «?» dentro del cuerpo
+                    'calcular :a',                                            # «:a» fuera de un procedimiento
+                    'ejecutar p(1) ejecutar']:
+            with self.assertRaises(SBDError, msg=mal):
+                self.db.execute(mal)
+        self.db.execute('crear procedimiento p(a) { calcular :a }')
+        for mal in ['ejecutar p()', 'ejecutar p(1, 2)', 'ejecutar noexiste(1)',
+                    'crear procedimiento p(b) { calcular :b }', 'ejecutar p(saldo)']:
+            with self.assertRaises(SBDError, msg=mal):
+                self.db.execute(mal)
+        self.assertEqual(rows(self.db, 'ejecutar p(4)'), [(4,)])
+
+    def test_el_limite_de_tiempo_vale_para_toda_la_llamada(self):
+        self.db.time_limit = 0.05
+        self.db.execute('empezar')
+        for _ in range(3000):
+            self.db.execute('insertar en cuentas (saldo) (1)')
+        self.db.execute('confirmar')
+        self.db.execute('crear procedimiento lento() { buscar cuentas como a unir cuentas como b en a.id + b.id > 0 mostrar contar() }')
+        with self.assertRaises(SBDError) as ctx:
+            self.db.execute('ejecutar lento()')
+        self.assertIn('tardado demasiado', str(ctx.exception))
+
+    def test_usa_los_indices_igual_que_una_orden_suelta(self):
+        self.db.execute('crear procedimiento uno(n) { buscar cuentas donde id = :n mostrar saldo }')
+        self.assertEqual(rows(self.db, 'ejecutar uno(2)'), [(0,)])
+
+    def test_renombrar_una_tabla_actualiza_sus_procedimientos(self):
+        self.db.execute(self.TRANSFERIR)
+        r = self.db.execute('renombrar tabla cuentas a saldos')
+        self.assertIn('transferir', r.message)
+        self.assertEqual(rows(self.db, 'ejecutar transferir(1, 2, 1)'), [(99,), (1,)])
+        self.db.close()
+        self.db = sbd.conectar(self.ruta)
+        self.assertEqual(rows(self.db, 'ejecutar transferir(1, 2, 1)'), [(98,), (2,)])
+        self.db.execute('renombrar tabla saldos a cuentas')
+
+    def test_renombrar_no_toca_un_parametro_que_se_llama_como_la_tabla(self):
+        self.db.execute('crear procedimiento p(cuentas) { actualizar cuentas poner saldo = :cuentas donde id = 1 }')
+        self.db.execute('renombrar tabla cuentas a saldos')
+        self.db.execute('ejecutar p(9)')
+        self.assertEqual(rows(self.db, 'buscar saldos donde id = 1 mostrar saldo'), [(9,)])
+        self.db.execute('renombrar tabla saldos a cuentas')
+
+    def test_renombrar_una_columna_avisa(self):
+        self.db.execute('crear tabla notas { id entero clave  texto texto }')
+        self.db.execute('crear procedimiento p(t) { insertar en notas { texto: :t } }')
+        self.assertIn('revisa a mano los procedimientos: p',
+                      self.db.execute('renombrar columna notas.texto a contenido').message)
+
+    def test_palabras_nuevas_siguen_valiendo_como_nombres(self):
+        self.db.execute('crear tabla ejecutar { id entero clave  procedimientos texto  procedimiento texto }')
+        self.db.execute('insertar en ejecutar { procedimientos: "a", procedimiento: "b" }')
+        self.assertEqual(rows(self.db, 'buscar ejecutar mostrar procedimientos, procedimiento'), [('a', 'b')])
+        self.db.close()
+        self.db = sbd.conectar(self.ruta)
+        self.assertEqual(rows(self.db, 'buscar ejecutar mostrar procedimiento'), [('b',)])
+
+    def test_la_sesion_aplica_los_permisos_y_los_limites(self):
+        srv = sbd.servidor(os.path.join(self.tmp, 'datos'))
+        self.addCleanup(srv.cerrar)
+        admin = sbd.Sesion(srv)
+        admin.ejecutar('crear base b  crear tabla t { id entero clave }')
+        admin.ejecutar('crear procedimiento mete() { insertar en t {} }  crear procedimiento lee() { buscar t }')
+        admin.ejecutar('crear usuario lector clave "una clave larga" puede leer  crear usuario escritor clave "una clave larga" puede escribir')
+        lector = sbd.Sesion(srv, 'b', usuario=srv.usuario('lector'), permite_ficheros=False)
+        self.assertEqual(lector.ejecutar('procedimientos').rowcount, 2)     # ver cuáles hay sí puede
+        for orden in ['ejecutar mete()', 'crear procedimiento x() { calcular 1 }', 'borrar procedimiento lee']:
+            with self.assertRaises(sbd.PermisoDenegado, msg=orden):
+                lector.ejecutar(orden)
+        escritor = sbd.Sesion(srv, 'b', usuario=srv.usuario('escritor'), permite_ficheros=False)
+        escritor.ejecutar('ejecutar mete()')
+        self.assertEqual(admin.ejecutar('buscar t mostrar contar()').scalar(), 1)
+        self.assertIn('ejecutar mete()', [f[3] for f in admin.ejecutar('historial').rows])  # queda auditado
+        # Una cuenta con su límite de filas tampoco se lo salta con un procedimiento
+        srv.cambiar_ajustes(registro=True, max_filas=1)
+        srv.registrar('ana', 'una clave larga')
+        ana = sbd.Sesion(srv, usuario=srv.usuario('ana'), permite_ficheros=False)
+        ana.ejecutar('crear base de_ana  crear tabla t { id entero clave }  crear procedimiento mete() { insertar en t {} }')
+        ana.ejecutar('ejecutar mete()')
+        with self.assertRaises(sbd.PermisoDenegado):
+            ana.ejecutar('ejecutar mete()')
+        ana.cerrar(); lector.cerrar(); escritor.cerrar(); admin.cerrar()
+
+    def test_copiar_base_y_volcado_conservan_los_procedimientos(self):
+        from sbd.web.server import Nucleo
+        srv = sbd.servidor(os.path.join(self.tmp, 'datos'))
+        self.addCleanup(srv.cerrar)
+        s = sbd.Sesion(srv)
+        s.ejecutar('crear base b  crear tabla t { id entero clave  n entero }  '
+                   'crear procedimiento p(n) { insertar en t { n: :n } }')
+        s.ejecutar('copiar base b a c  usar c  ejecutar p(1)')
+        self.assertEqual(s.ejecutar('buscar t mostrar n').rows, [(1,)])
+        n = Nucleo(srv)
+        volcado = n.volcar(None, 'b', None, 'sbd')[0]
+        self.assertIn('crear procedimiento p(n)', volcado)
+        self.assertEqual([x['nombre'] for x in n.base(None, 'b')['procedimientos']], ['p'])
+        destino = sbd.conectar(os.path.join(self.tmp, 'd2.base'))
+        script = '\n'.join(l for l in volcado.splitlines() if not l.startswith(('crear base', 'usar ')))
+        destino.execute(script)
+        destino.execute('ejecutar p(3)')
+        self.assertEqual(rows(destino, 'buscar t mostrar n'), [(3,)])
+        destino.close()
 
 
 if __name__ == '__main__':

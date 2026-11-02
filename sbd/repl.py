@@ -37,6 +37,8 @@ AYUDA = """\
              importar "clientes.csv" en clientes   (CSV o Excel; si la tabla no existe, se crea)
              explicar buscar pedidos donde fecha > hace 30 dias   (cómo se ejecuta: ¿usa un índice?)
   CAMBIOS    empezar · confirmar · deshacer
+  PROCEDIM.  crear procedimiento subir(id, n) { actualizar t poner x = x + :n donde id = :id }
+             ejecutar subir(1, 5) · procedimientos · borrar procedimiento subir
   USUARIOS   usuarios · crear usuario ana clave "…" puede leer|escribir|todo [en tienda]
              cambiar clave de ana a "…" · cambiar permiso de ana a leer · borrar usuario ana
   API        crear clave api para ana [llamada "web"] · claves api · borrar clave api k1a2b3c4

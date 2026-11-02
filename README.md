@@ -133,6 +133,29 @@ donde  │ se comprueba la condición en cada fila candidata
 
 Los índices sirven para `=` y para rangos (`>`, `<`, `entre`); los `unir` por igualdad no los necesitan. Si dice «se recorren sus … filas» en una tabla grande, prueba con `indexar tabla (columna)`.
 
+### Procedimientos
+
+Órdenes guardadas en la base, con nombre y parámetros, que se ejecutan juntas:
+
+```
+crear procedimiento transferir(origen, destino, cantidad) {
+  actualizar cuentas poner saldo = saldo - :cantidad donde id = :origen
+  actualizar cuentas poner saldo = saldo + :cantidad donde id = :destino
+  buscar cuentas donde id en [:origen, :destino]
+}
+
+ejecutar transferir(1, 2, 30)       -- también: ejecutar transferir(?, ?, ?) desde un programa
+procedimientos                      -- los que hay, con su definición
+borrar procedimiento transferir
+```
+
+- **Todo o nada:** si una orden del cuerpo falla, se deshace la llamada entera. Dentro de `empezar … confirmar`, solo se deshace esa llamada y la transacción sigue abierta.
+- **Parámetros con `:`:** `:saldo` es el parámetro y `saldo` la columna, aunque se llamen igual.
+- **Qué devuelve:** las filas de la última consulta del cuerpo o, si no hay ninguna, un resumen con las filas afectadas.
+- **Qué puede llevar dentro:** `buscar`, `insertar`, `actualizar`, `borrar`, `vaciar` y `ejecutar` (otro procedimiento, hasta 16 niveles). No admite `empezar` ni `confirmar`, cambios de estructura, `importar` ni órdenes de servidor. Tampoco hay `si` ni bucles: para decidir según los datos, usa `comprobar` en las tablas o la lógica de tu programa.
+- **Permisos:** se ejecutan con los permisos de quien llama. Quien solo puede leer ve la lista, pero no los ejecuta. Los límites de una cuenta también se aplican.
+- **Si cambia la estructura:** al renombrar una tabla, sus procedimientos se actualizan solos; al renombrar una columna, SBD avisa de cuáles revisar. Las tablas se buscan al ejecutar, así que un nombre mal escrito da error en ese momento, no al crearlo.
+
 ### Importar CSV y Excel
 
 ```
@@ -386,6 +409,8 @@ $db->transaccion(function (SBD $t) { $t->ejecutar('borrar de carrito donde caduc
 
 Los errores llegan como excepción (`ErrorServidor`, `ErrorSBD`, `SBDException`) con el mensaje en español y un `tipo` para decidir qué hacer: `sintaxis`, `orden`, `permiso`, `ocupada`, `clave`… La API está descrita entera en [PRODUCCION.md](PRODUCCION.md#la-api).
 
+**Con un ORM:** la carpeta [orm/](orm/README.md) tiene un conector de SQLAlchemy (`create_engine("sbd:///datos/mi_base.base")` o, por un servidor, `"sbd+https://:CLAVE@datos.miweb.es/mi_base"`) y una biblioteca de ejemplo con su web. Traduce el SQL que genera SQLAlchemy a las órdenes de SBD; el lenguaje de SBD no cambia, y SBD sigue sin depender de nada, porque SQLAlchemy solo se instala con `pip install ./orm`.
+
 **Sin servidor**, dentro del mismo programa (scripts, pruebas, herramientas de una persona):
 
 ```python
@@ -415,8 +440,9 @@ texto ──▶ lexer.py ──▶ parser.py ──▶ árbol (nodes.py) ──�
   - `nombre.base` es una foto completa: JSON con la estructura escrita en SBD y los datos.
   - `nombre.diario` recibe una línea por cada cambio confirmado, solo con las filas que cambiaron. Con 20.000 filas, guardar un cambio pasa de 92 ms a menos de 1 ms.
   - Al abrir, se carga la foto y se repite el diario encima. Cuando el diario crece más que la foto, se compacta en una foto nueva; también al cerrar.
-  - La foto se escribe de forma atómica: primero un temporal y luego un renombrado.
-  - Una línea del diario a medio escribir por un corte de luz se descarta.
+  - La foto se escribe de forma atómica: primero un temporal con `fsync`, luego un renombrado y un `fsync` de la carpeta. El diario solo se borra después.
+  - Al confirmar, la transacción entera se escribe como una sola línea del diario, con `fsync`, antes de responder. Una línea a medio escribir se descarta, así que nunca queda una transacción a medias.
+  - Está probado matando el proceso con `kill -9` y cortando el diario en cada byte, y las pruebas comprueban el orden de los `fsync`. Un corte de luz real no se ha probado: la seguridad depende también de que el disco cumpla con `fsync`.
 - **Cerrojos:** el sistema operativo bloquea la carpeta y cada fichero mientras un programa los usa, y los suelta solo si ese programa muere.
 - **Servidor:** un solo proceso tiene las bases abiertas y ejecuta las órdenes de una en una, como SQLite: cada orden ve siempre datos coherentes. Cada sesión tiene su propia transacción; si otra sesión intenta escribir en una base con una transacción abierta ajena, espera hasta 5 segundos y, si sigue ocupada, recibe el error `ocupada`. Una transacción olvidada se deshace sola a los 2 minutos sin uso.
 
@@ -425,5 +451,5 @@ texto ──▶ lexer.py ──▶ parser.py ──▶ árbol (nodes.py) ──�
 - **Cada base vive entera en memoria**, unos 1,8 KB por fila. Va cómoda hasta unos cientos de miles de filas por base. Con un millón funciona (1,8 GB de RAM y 13 s para abrirla), pero lo que recorre la tabla entera tarda segundos. Para decenas de millones no está pensada. Las cifras medidas están en [PRODUCCION.md](PRODUCCION.md#cuánto-aguanta).
 - **Un solo proceso** atiende todas las peticiones, de una en una: unos cientos de peticiones por segundo. Sobra para webs, tiendas y herramientas internas, pero no para miles de peticiones por segundo.
 - **Sin réplicas:** hay una sola máquina. Las copias diarias están en el mismo disco, así que llévalas también a otro sitio (está explicado en PRODUCCION.md).
-- Todavía no tiene disparadores.
+- Todavía no tiene disparadores, y los procedimientos no tienen `si` ni bucles.
 - Al renombrar una columna, si otra tabla de la misma vista tiene una columna con ese nombre, la vista no se toca y se avisa de que hay que revisarla a mano.

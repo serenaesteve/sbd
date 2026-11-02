@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sbd"
-version = "3.1.1"
+version = "3.2.0"
 description = "Base de datos con lenguaje propio en español: motor, servidor con API, panel web y clientes"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Biblioteca · SBD</title>
+  <meta name="description" content="Una biblioteca hecha con SQLAlchemy sobre SBD: cada acción enseña el objeto, el SQL y la orden de SBD.">
+  <meta name="color-scheme" content="light dark">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23f6f1e4'/%3E%3Cpath d='M8 7h4v18H8zm6 0h4v18h-4zm7 1l3 17' stroke='%23c33' stroke-width='2' fill='%231d2230'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,500;1,6..72,400;1,6..72,500&family=Spline+Sans+Mono:wght@400;500;600&display=swap">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <a class="salto" href="#vista">Ir al contenido</a>
+  <header class="cabecera">
+    <div>
+      <p class="migas"><a href="../">SBD</a> <span aria-hidden="true">›</span> biblioteca</p>
+      <h1>Biblioteca</h1>
+      <p class="subtitulo">Objetos de Python guardados en SBD con un ORM. Haz algo y mira el camino que recorre: del objeto al SQL, y del SQL a la orden de SBD.</p>
+    </div>
+    <p class="quien" id="quien" role="status"></p>
+  </header>
+  <nav class="pestanas" id="pestanas" aria-label="Secciones"></nav>
+  <div class="mesa">
+    <main class="vista" id="vista" tabindex="-1"></main>
+    <aside class="ruta" aria-labelledby="titulo-ruta">
+      <h2 id="titulo-ruta">El camino de la última acción</h2>
+      <div id="ruta" aria-live="polite"></div>
+    </aside>
+  </div>
+  <footer class="pie">
+    <p>Datos de ejemplo: socios y préstamos inventados. <span id="conexion"></span></p>
+  </footer>
+  <dialog class="ficha" id="ficha"></dialog>
+  <script src="app.js"></script>
+</body>
+</html>

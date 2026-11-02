@@ -11,8 +11,8 @@ from functools import lru_cache
 
 from .errors import SBDError
 from .functions import FUNCTIONS
-from .nodes import (AGGREGATES, WINDOW_ONLY, Between, Binary, Case, Cast, Column, DefaultValue, Exists,
-                    FuncCall, InList, InSelect, IsNull, Join, Like, Literal, Param, Star, Subquery, SubqueryRef,
+from .nodes import (AGGREGATES, WINDOW_ONLY, ArgProc, Between, Binary, Case, Cast, Column, DefaultValue, Exists,
+                    FuncCall, InList, InSelect, IsNull, Join, Like, Literal, Param, Select, Star, Subquery, SubqueryRef,
                     TableRef, Unary, Window, flatten_and, has_aggregate, is_aggregate, mentions_table, walk)
 from .result import Result
 from .values import (Intervalo, arithmetic, compare, convert, hash_key, sort_key, sumar_numeros, to_number,
@@ -136,12 +136,17 @@ def _sort_items(items, order_by):
                    reverse=item.desc)
 
 
+MAX_PROFUNDIDAD = 16  # procedimientos llamándose unos a otros
+
+
 class Executor:
     """Ejecuta una sentencia. Se crea uno nuevo por sentencia."""
 
     def __init__(self, db, params=(), time_limit=None):
         self.db = db
         self.params = params
+        self.args = {}          # los «:nombre» del procedimiento que se está ejecutando
+        self.profundidad = 0
         self._deadline = time.monotonic() + time_limit if time_limit else None
         self._steps = 0
         self.cte_stack = []
@@ -182,6 +187,46 @@ class Executor:
         return self.db.alter_table(stmt, self)
 
     # ============================================================ utilidades
+    def _exec_CreateProcedure(self, stmt):
+        return self.db.create_procedure(stmt)
+
+    def _exec_DropProcedure(self, stmt):
+        return self.db.drop_procedure(stmt)
+
+    def _exec_ShowProcedures(self, stmt):
+        return Result(['procedimiento', 'parámetros', 'definición'],
+                      [(p.name, ', '.join(p.params), p.sql) for _, p in sorted(self.db.procedures.items())])
+
+    def _exec_CallProcedure(self, stmt):
+        """Las órdenes del cuerpo comparten el «deshacer» de esta orden: si una falla, se deshacen todas."""
+        proc = self.db.procedures.get(stmt.name)
+        if proc is None:
+            raise SBDError(f"no existe ningún procedimiento «{stmt.name}» (escribe «procedimientos» para ver los que hay)")
+        if len(stmt.args) != len(proc.params):
+            raise SBDError(f"el procedimiento {stmt.name}({', '.join(proc.params)}) necesita "
+                           f"{len(proc.params)} valor(es) y se le han pasado {len(stmt.args)}")
+        if self.profundidad >= MAX_PROFUNDIDAD:
+            raise SBDError(f"demasiados procedimientos llamándose unos a otros (el máximo es {MAX_PROFUNDIDAD}): "
+                           f"¿{stmt.name} se llama a sí mismo?")
+        env = Env(EMPTY_SCOPE, {})
+        args = dict(zip(proc.params, [self.eval(a, env) for a in stmt.args]))
+        ultima, afectadas, ultimo_id = None, 0, None
+        for orden in proc.body:
+            if self._deadline is not None and time.monotonic() > self._deadline:
+                raise SBDError("la orden ha tardado demasiado y se ha cortado; no se ha guardado nada de ella")
+            sub = Executor(self.db)
+            sub.args, sub.profundidad, sub._deadline = args, self.profundidad + 1, self._deadline
+            r = sub.execute(orden)
+            if r.columns is not None:
+                ultima = r
+            if not isinstance(orden, Select):
+                afectadas += r.rowcount
+                ultimo_id = r.lastrowid if r.lastrowid is not None else ultimo_id
+        if ultima is not None:
+            return Result(ultima.columns, ultima.rows, lastrowid=ultimo_id)
+        return Result(rowcount=afectadas, lastrowid=ultimo_id, message=(
+            f"Procedimiento {stmt.name} ejecutado: {_plural(afectadas, 'afectada')}"))
+
     def _exec_ShowTables(self, stmt):
         rows = [(name, 'tabla', len(t.rows)) for name, t in sorted(self.db.tables.items())]
         rows += [(name, 'vista', None) for name in sorted(self.db.views)]
@@ -328,6 +373,9 @@ class Executor:
         if node.index >= len(self.params):
             raise SBDError("faltan valores para los parámetros «?»")
         return self.params[node.index]
+
+    def _eval_arg(self, node, env):
+        return self.args[node.name]
 
     def _eval_column(self, node, env):
         if node.table is None and env.outputs is not None and node.name in env.outputs:
@@ -1321,6 +1369,7 @@ class Executor:
 _DISPATCH = {
     Literal: Executor._eval_literal,
     Param: Executor._eval_param,
+    ArgProc: Executor._eval_arg,
     Column: Executor._eval_column,
     Star: Executor._eval_star,
     DefaultValue: Executor._eval_default,

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "biblioteca-orm"
+version = "1.0.0"
+description = "Conector de SQLAlchemy para SBD y una biblioteca de ejemplo. Se instala junto a SBD: pip install . ./orm"
+requires-python = ">=3.11"
+dependencies = ["SQLAlchemy>=2.0,<2.1"]
+
+# Así SQLAlchemy encuentra el dialecto «sbd» por sí solo al instalar el paquete
+[project.entry-points."sqlalchemy.dialects"]
+sbd = "sqlalchemy_sbd.dialecto:DialectoSBD"
+"sbd.http" = "sqlalchemy_sbd.dialecto:DialectoSBDServidor"
+"sbd.https" = "sqlalchemy_sbd.dialecto:DialectoSBDServidor"
+
+[tool.setuptools]
+packages = ["sqlalchemy_sbd", "biblioteca"]
+
+[tool.setuptools.package-data]
+biblioteca = ["estatico/*"]

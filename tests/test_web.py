@@ -183,6 +183,11 @@ class TestPanelConUsuarios(unittest.TestCase):
         status, datos, _ = self.peticion('/api/entrar', {'usuario': 'jefa', 'clave': 'clave de la jefa'})
         self.assertEqual(status, 429)
 
+    def test_los_enlaces_se_ven_sin_entrar(self):
+        self.server.nucleo.enlaces.append({'texto': 'Biblioteca', 'url': '/biblioteca/'})
+        self.assertEqual(self.peticion('/api/estado')[1]['enlaces'], [{'texto': 'Biblioteca', 'url': '/biblioteca/'}])
+        self.server.nucleo.enlaces.clear()
+
     def test_detras_de_un_proxy(self):
         self.server.dominios = {'datos.miweb.es'}
 

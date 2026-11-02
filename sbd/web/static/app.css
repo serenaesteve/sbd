@@ -203,6 +203,9 @@ code { font: inherit; background: var(--papel-hondo); padding: 0 4px; }
 .quien .enlace { font-size: var(--t-12); margin-left: var(--e-2); }
 .quien.abierto { color: var(--rojo); }
 
+.atajos:empty { display: none; }
+.atajos { display: flex; flex-direction: column; align-items: flex-start; gap: var(--e-1); }
+
 /* -------------------------------------------------------------- carpeta */
 .carpeta { display: flex; flex-direction: column; min-width: 0; height: 100dvh; }
 .cabecera { padding: var(--e-4) var(--e-7) 0; }
@@ -565,6 +568,9 @@ pre.mini { margin: 0; font: 400 var(--t-12)/1.5 var(--mono); white-space: pre-wr
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
 }
+
+.procedimiento summary { cursor: pointer; }
+.procedimiento pre { margin-top: var(--e-2); }
 
 /* ------------------------------------------------------------ mi cuenta */
 .consumos { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: var(--e-4) var(--e-6); max-width: 900px; }

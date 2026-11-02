@@ -8,9 +8,11 @@ from .errors import IncompleteInputError, SBDError
 from .functions import ALIASES
 from .lexer import tokenize
 from .values import UNIDADES, intervalo
-from .nodes import (CTE, AlterTable, Begin, Between, Binary, Case, Cast, ChangePassword, ChangePermission,
-                    Column, ColumnDef, Commit, CopyDatabase, CreateApiKey, CreateDatabase, CreateIndex, CreateTable,
-                    CreateUser, CreateView, DefaultValue, Delete, DropApiKey, DropUser, ShowApiKeys, ShowUsers,
+from .nodes import (CTE, AlterTable, ArgProc, Begin, Between, Binary, CallProcedure, Case, Cast, ChangePassword,
+                    ChangePermission, Column, ColumnDef, Commit, CopyDatabase, CreateApiKey, CreateDatabase,
+                    CreateIndex, CreateProcedure, CreateTable,
+                    CreateUser, CreateView, DefaultValue, Delete, DropApiKey, DropProcedure, DropUser, ShowApiKeys,
+                    ShowProcedures, ShowUsers,
                     Describe, DropDatabase, DropIndex, DropTable, DropView, Exists, Explain, ForeignKey, FuncCall,
                     Import, InList, Insert, InSelect, IsNull, Join, Like, Literal, OrderItem, Param,
                     RecoverDatabase, RestoreBackup, Rollback, Select, SelectCore, SelectItem, ShowBackups,
@@ -29,7 +31,7 @@ STATEMENTS = frozenset({
     'buscar', 'calcular', 'con', 'insertar', 'actualizar', 'borrar', 'vaciar', 'crear', 'añadir',
     'anadir', 'quitar', 'renombrar', 'indexar', 'usar', 'bases', 'tablas', 'indices', 'índices',
     'describir', 'empezar', 'confirmar', 'deshacer', 'papelera', 'recuperar', 'importar', 'cambiar',
-    'usuarios', 'claves', 'copiar', 'copias', 'restaurar', 'historial', 'explicar'})
+    'usuarios', 'claves', 'copiar', 'copias', 'restaurar', 'historial', 'explicar', 'ejecutar', 'procedimientos'})
 
 CLAUSES = frozenset({'unir', 'cruzar', 'donde', 'agrupar', 'teniendo', 'mostrar', 'distintos',
                      'ordenar', 'limite', 'límite', 'saltar'})
@@ -38,7 +40,8 @@ CLAUSES = frozenset({'unir', 'cruzar', 'donde', 'agrupar', 'teniendo', 'mostrar'
 KEYWORDS = RESERVED | STATEMENTS | CLAUSES | frozenset({
     'y', 'o', 'es', 'en', 'entre', 'contiene', 'empieza', 'termina', 'parece', 'como', 'union',
     'comun', 'común', 'excepto', 'poner', 'todas', 'desde', 'cuando', 'entonces', 'sino', 'fin',
-    'clave', 'obligatorio', 'unico', 'único', 'comprobar', 'usando', 'devolver', 'sobre', 'puede', 'usuario'})
+    'clave', 'obligatorio', 'unico', 'único', 'comprobar', 'usando', 'devolver', 'sobre', 'puede', 'usuario',
+    'procedimiento'})
 
 ON_DELETE = {'impedir': 'restrict', 'cascada': 'cascade', 'anular': 'set null'}
 COMPARISON = frozenset({'=', '!=', '<', '<=', '>', '>='})
@@ -55,7 +58,13 @@ SQL_HINTS = {
     'begin': 'empezar', 'commit': 'confirmar', 'rollback': 'deshacer',
     'show': 'tablas  ·  bases  ·  indices', 'describe': 'describir tabla', 'use': 'usar base',
     'with': 'con nombre = (buscar …) buscar nombre',
+    'call': 'ejecutar nombre(valores)', 'exec': 'ejecutar nombre(valores)',
 }
+
+# Lo único que puede ir dentro de un procedimiento. Es una lista de lo permitido, no de lo prohibido:
+# una orden nueva queda fuera hasta decidirlo. «importar», por ejemplo, leería ficheros del servidor
+# sin pasar por los permisos de la sesión.
+EN_PROCEDIMIENTO = (Select, Insert, Update, Delete, CallProcedure)
 
 
 def parse_script(source):
@@ -68,6 +77,7 @@ class Parser:
         self.tokens = tokenize(source)
         self.pos = 0
         self.param_count = 0
+        self.args_proc = None  # los parámetros del procedimiento que se está leyendo
 
     # ------------------------------------------------------------ utilidades
     def peek(self, offset=0):
@@ -177,13 +187,20 @@ class Parser:
             return handlers[word]()
         simple = {'bases': ShowDatabases, 'tablas': ShowTables, 'empezar': Begin,
                   'confirmar': Commit, 'deshacer': Rollback, 'papelera': ShowTrash, 'usuarios': ShowUsers,
-                  'copias': ShowBackups}
+                  'copias': ShowBackups, 'procedimientos': ShowProcedures}
         if word in simple:
             self.advance()
             return simple[word]()
         if word in ('indices', 'índices'):
             self.advance()
             return ShowIndexes(self.ident('una tabla') if self.accept('de') else None)
+        if word == 'ejecutar':
+            self.advance()
+            nombre = self.ident('el nombre del procedimiento')
+            self.expect_op('(')
+            args = [] if self.at_op(')') else self.parse_expr_list()
+            self.expect_op(')')
+            return CallProcedure(nombre, args)
         if word == 'explicar':
             self.advance()
             if not self.at('buscar', 'calcular', 'con'):
@@ -496,6 +513,15 @@ class Parser:
             self.advance()
             self.param_count += 1
             return Param(self.param_count - 1)
+        if self.at_op(':'):
+            self.advance()
+            nombre = self.ident('el nombre de un parámetro')
+            if self.args_proc is None:
+                raise SBDError(f"«:{nombre}» solo vale dentro de un procedimiento; aquí usa «?» o el valor")
+            if nombre not in self.args_proc:
+                raise SBDError(f"el procedimiento no tiene ningún parámetro «{nombre}» "
+                               f"(tiene: {', '.join(self.args_proc) or 'ninguno'})")
+            return ArgProc(nombre)
         if self.accept_op('('):
             if self.at('buscar', 'calcular', 'con'):
                 query = self.parse_query()
@@ -692,9 +718,9 @@ class Parser:
                 raise SBDError(f"indica qué filas borrar con «donde …». Para borrarlas todas: vaciar {table}")
             where = self.parse_expr()
             return Delete(table, where, self.parse_returning())
-        what = self.accept('tabla', 'vista', 'indice', 'índice', 'base', 'usuario', 'clave')
+        what = self.accept('tabla', 'vista', 'indice', 'índice', 'base', 'usuario', 'clave', 'procedimiento')
         if what is None:
-            self.error("se esperaba «de tabla donde …», o tabla, vista, indice, base o usuario")
+            self.error("se esperaba «de tabla donde …», o tabla, vista, indice, base, usuario o procedimiento")
         if what == 'clave':
             self.expect('api')
             return DropApiKey(self.ident('el identificador de la clave'))
@@ -703,7 +729,7 @@ class Parser:
         name = self.ident()
         if_exists = self.parse_if_exists()
         node = {'tabla': DropTable, 'vista': DropView, 'indice': DropIndex, 'índice': DropIndex,
-                'base': DropDatabase}[what]
+                'base': DropDatabase, 'procedimiento': DropProcedure}[what]
         return node(name, if_exists)
 
     def parse_vaciar(self):
@@ -767,7 +793,7 @@ class Parser:
 
     def parse_create(self):
         self.expect('crear')
-        what = self.accept('tabla', 'vista', 'base', 'indice', 'índice', 'usuario', 'clave')
+        what = self.accept('tabla', 'vista', 'base', 'indice', 'índice', 'usuario', 'clave', 'procedimiento')
         if what == 'clave':
             self.expect('api')
             user = self.ident('el nombre del usuario') if self.accept('para') else None
@@ -786,6 +812,8 @@ class Parser:
             return CreateUser(name, password, permission, bases)
         if what == 'tabla':
             return self.parse_create_table()
+        if what == 'procedimiento':
+            return self.parse_create_procedure()
         if what == 'vista':
             name = self.ident('el nombre de la vista')
             if_not_exists = self.parse_if_not_exists()
@@ -799,6 +827,39 @@ class Parser:
         if what in ('indice', 'índice'):
             raise SBDError("los índices se crean con «indexar tabla (columna)»")
         self.error("se esperaba tabla, vista o base")
+
+    def parse_create_procedure(self):
+        name = self.ident('el nombre del procedimiento')
+        self.expect_op('(')
+        params = [] if self.at_op(')') else [self.ident('el nombre de un parámetro')]
+        while self.accept_op(','):
+            params.append(self.ident('el nombre de un parámetro'))
+        self.expect_op(')')
+        if len(set(params)) != len(params):
+            raise SBDError(f"el procedimiento «{name}» repite un parámetro")
+        self.expect_op('{')
+        fuera, self.args_proc = self.args_proc, params
+        interrogantes = self.param_count
+        cuerpo = []
+        primero = self.peek()
+        while not self.at_op('}'):
+            if self.accept_op(';'):
+                continue
+            orden = self.parse_statement()
+            if not isinstance(orden, EN_PROCEDIMIENTO):
+                raise SBDError("dentro de un procedimiento solo van buscar, insertar, actualizar, borrar, vaciar "
+                               "y ejecutar (ya es todo o nada: no hacen falta «empezar» ni «confirmar»)")
+            cuerpo.append(orden)
+            if not (self.at_op('}') or self.at_statement_end()):
+                self.error("aquí debería acabar la orden (¿falta una coma o sobra una palabra?)")
+        self.args_proc = fuera
+        if not cuerpo:
+            raise SBDError(f"el procedimiento «{name}» necesita al menos una orden")
+        if self.param_count != interrogantes:
+            raise SBDError("dentro de un procedimiento, los valores se escriben con «:nombre», no con «?»")
+        sql = self.text_since(primero)
+        self.expect_op('}')
+        return CreateProcedure(name, params, cuerpo, sql)
 
     def parse_create_table(self):
         name = self.ident('el nombre de la tabla')

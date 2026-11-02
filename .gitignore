@@ -2,6 +2,8 @@ __pycache__/
 *.pyc
 # Las bases de datos son datos de cada instalación, no código
 datos/
+# Copias de producción, con los resúmenes de las contraseñas: nunca al repositorio
+respaldos/
 *.base
 *.diario
 *.lock

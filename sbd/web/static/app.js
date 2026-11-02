@@ -15,6 +15,7 @@ const estado = {
   usuario: null,
   sinUsuarios: true,
   registro: false,
+  enlaces: [],
   directorio: '',
   bases: [],
   infos: new Map(),
@@ -294,6 +295,7 @@ function pintarQuien() {
 function pintarIndice() {
   $('#directorio').textContent = estado.directorio;
   $('#nueva-base').hidden = !puedeCrearBases();
+  $('#otras-paginas').replaceChildren(...estado.enlaces.map(e => h('a', { class: 'enlace', href: e.url }, `${e.texto} →`)));
   pintarQuien();
   const filtro = $('#filtro-indice').value.trim().toLowerCase();
   const r = estado.ruta;
@@ -588,7 +590,7 @@ function vistaBases() {
 function vistaTablas() {
   const info = estado.info;
   const base = info.nombre;
-  if (!info.tablas.length && !info.vistas.length) {
+  if (!info.tablas.length && !info.vistas.length && !info.procedimientos.length) {
     return vacio(`«${base}» todavía no tiene tablas.`,
       'Diséñala con el formulario o escríbela en código: las dos cosas crean lo mismo.',
       puedeEscribir() && h('a', { class: 'boton-tinta', href: enlace({ base, p: 'nueva' }) }, 'crear la primera tabla'),
@@ -609,7 +611,7 @@ function vistaTablas() {
         boton: 'vaciar', texto: `Se borran sus ${plural(t.filas, 'fila', 'filas')}; la tabla y su estructura se quedan.` }), 'peligro'),
       puedeEscribir() && accion('borrar', () => hacerSiConfirma({ titulo: `Borrar la tabla ${t.nombre}`,
         orden: `borrar tabla ${nombre(t.nombre)}`, texto: 'Se borran la tabla, su estructura y todas sus filas.' }), 'peligro')));
-  return seccion('Tablas', h('div', { class: 'hoja-datos' }, h('table', { class: 'registro' },
+  return [seccion('Tablas', h('div', { class: 'hoja-datos' }, h('table', { class: 'registro' },
     h('thead', {}, h('tr', {}, h('th', {}, 'tabla'), h('th', { class: 'num' }, 'filas'), h('th', { class: 'num' }, 'columnas'),
       h('th', {}, 'clave'), h('th', {}, h('span', { class: 'visualmente-oculto' }, 'acciones')))),
     h('tbody', {}, info.tablas.map(fila),
@@ -621,7 +623,21 @@ function vistaTablas() {
           puedeEscribir() && accion('borrar', () => hacerSiConfirma({ titulo: `Borrar la vista ${v}`, orden: `borrar vista ${nombre(v)}`,
             texto: 'Solo se borra la consulta guardada; los datos de las tablas no se tocan.' }), 'peligro'))))),
     h('tfoot', {}, h('tr', {}, h('td', {}, plural(info.tablas.length, 'tabla', 'tablas')), h('td', { class: 'num' }, cifra(filasTotales)),
-      h('td', { colspan: '3', class: 'tenue' }, bytes(info.bytes)))))));
+      h('td', { colspan: '3', class: 'tenue' }, bytes(info.bytes))))))), seccionProcedimientos(info)];
+}
+
+/* Los procedimientos de la base: órdenes guardadas que se ejecutan juntas, todo o nada. */
+function seccionProcedimientos(info) {
+  return seccion('Procedimientos',
+    info.procedimientos.length ? h('ul', { class: 'lista-simple' }, info.procedimientos.map(p => h('li', {},
+      h('details', { class: 'procedimiento' },
+        h('summary', {}, h('b', {}, p.nombre), `(${p.parametros.join(', ')})`), preOrden(p.definicion, 'definicion')),
+      h('span', { class: 'empuje' }),
+      accion('ejecutar', () => llevarACodigo(`ejecutar ${nombre(p.nombre)}(${p.parametros.join(', ')})`)),
+      puedeEscribir() && accion('borrar', () => hacerSiConfirma({ titulo: `Borrar el procedimiento ${p.nombre}`,
+        orden: `borrar procedimiento ${nombre(p.nombre)}`, texto: 'Solo se borra el procedimiento; las tablas y sus datos no se tocan.' }), 'peligro'))))
+      : h('p', { class: 'mensaje' }, 'Todavía no hay ninguno. Guardan varias órdenes que se ejecutan juntas: si una falla, no se aplica ninguna.'),
+    puedeEscribir() && h('button', { class: 'boton-linea', type: 'button', onclick: () => llevarACodigo(PLANTILLA_PROCEDIMIENTO) }, 'crear uno en Código'));
 }
 
 /* ----------------------------------------------------- tabla: examinar */
@@ -1560,6 +1576,11 @@ async function vistaCopias() {
 }
 
 /* ================================================================ CÓDIGO */
+const PLANTILLA_PROCEDIMIENTO = `crear procedimiento transferir(origen, destino, cantidad) {
+  actualizar cuentas poner saldo = saldo - :cantidad donde id = :origen
+  actualizar cuentas poner saldo = saldo + :cantidad donde id = :destino
+}`;
+
 const AYUDA = [
   ['Tablas', 'Tipos: entero, decimal, dinero, texto, texto(n), logico, fecha y fechahora. Marcas: clave, obligatorio, unico, = por defecto, comprobar y -> otra_tabla.',
     ['crear tabla clientes {\n  id      entero clave\n  nombre  texto(60) obligatorio\n  email   texto unico\n  saldo   dinero = 0\n  alta    fecha = hoy()\n}',
@@ -1580,6 +1601,8 @@ const AYUDA = [
     ['insertar o actualizar en clientes { email: "ana@ejemplo.es", nombre: "Ana" } devolver id',
       'buscar pedidos mostrar id, total,\n  puesto() sobre (por cliente_id ordenar total desc) como puesto',
       'explicar buscar pedidos donde fecha > hace 30 dias', 'crear vista madrileños = buscar clientes donde ciudad = "Madrid"']],
+  ['Procedimientos', 'Órdenes guardadas en la base que se ejecutan juntas: si una falla, no se aplica ninguna. Los parámetros se escriben :nombre.',
+    [PLANTILLA_PROCEDIMIENTO, 'ejecutar transferir(1, 2, 30)', 'procedimientos', 'borrar procedimiento transferir']],
   ['Cambios seguros', 'Dentro de una transacción nada se guarda hasta «confirmar».',
     ['empezar\nactualizar productos poner precio = precio * 1.1 todas\nconfirmar', 'deshacer']],
 ];
@@ -1589,7 +1612,7 @@ function plantillas() {
   const m = estado.meta;
   if (!m || m.tipo !== 'tabla') {
     return [['crear tabla', 'crear tabla nueva {\n  id      entero clave\n  nombre  texto obligatorio\n}'],
-      ['buscar', 'buscar tabla donde columna = valor'], ['tablas', 'tablas'], ['bases', 'bases']];
+      ['buscar', 'buscar tabla donde columna = valor'], ['procedimiento', PLANTILLA_PROCEDIMIENTO], ['tablas', 'tablas'], ['bases', 'bases']];
   }
   const t = nombre(m.nombre);
   const cols = m.columnas.filter(c => !c.auto);
@@ -1804,6 +1827,9 @@ function candidatos(texto, cursor) {
       ...(['buscar', 'unir', 'opcional', 'completo', 'inverso', 'cruzar', 'describir'].includes(anterior)
         ? info.vistas.map(v => ({ texto: v, clase: 'vista', que: '' })) : [])] };
   }
+  if (info && (anterior === 'ejecutar' || (anterior === 'procedimiento' && /\bborrar\s+procedimiento\s+$/.test(tras)))) {
+    return { prefijo: palabra, items: info.procedimientos.map(p => ({ texto: p.nombre, clase: 'procedimiento', que: `(${p.parametros.join(', ')})` })) };
+  }
   if (anterior === 'usar' || (anterior === 'base' && /\b(borrar|usar|copiar)\s+base\s+$/.test(tras))) {
     return { prefijo: palabra, items: estado.bases.map(b => ({ texto: b.nombre, clase: 'base', que: plural(b.tablas, 'tabla', 'tablas') })) };
   }
@@ -1869,7 +1895,7 @@ function aceptarSugerencia(i = sugerencias.elegida) {
   if (!it || !ed) return;
   const ta = ed.ta;
   // Tras una tabla o una palabra suele venir otra cosa; tras una columna, casi siempre una coma u operador.
-  const texto = it.clase === 'función' ? `${it.texto}(`
+  const texto = it.clase === 'función' || it.clase === 'procedimiento' ? `${nombre(it.texto)}(`
     : it.clase === 'columna' ? nombre(it.texto)
       : (it.clase === 'palabra' ? it.texto : nombre(it.texto)) + ' ';
   ta.setRangeText(texto, sugerencias.desde, ta.selectionStart, 'end');
@@ -1924,7 +1950,9 @@ function mostrarEntrada(mensaje, modo = 'entrar') {
       !registrar && h('p', { class: 'nota' }, primerUsuario
         ? 'Acabas de crear el primer usuario: desde ahora el panel pide entrar. Entra con él para seguir.'
         : estado.registro ? null : 'Los usuarios los crea quien administra el servidor.'),
-      cambiar),
+      cambiar,
+      estado.enlaces.length > 0 && h('p', { class: 'nota' }, 'Sin entrar, puedes ver: ',
+        estado.enlaces.map(e => h('a', { class: 'enlace', href: e.url }, e.texto)))),
     pie: h('form', { class: 'ficha-pie', method: 'dialog', onsubmit: async ev => {
       ev.preventDefault();
       if (registrar && clave.value !== repetir.value) {
@@ -1959,7 +1987,11 @@ function mostrarEntrada(mensaje, modo = 'entrar') {
 async function salir() {
   await api('/api/salir', {});
   estado.usuario = null;
-  try { estado.registro = Boolean((await api('/api/estado')).registro); } catch { /* se queda como estaba */ }
+  try {
+    const situacion = await api('/api/estado');
+    estado.registro = Boolean(situacion.registro);
+    estado.enlaces = situacion.enlaces || [];
+  } catch { /* se queda como estaba */ }
   $('#vista').replaceChildren();
   mostrarEntrada();
 }
@@ -2014,6 +2046,7 @@ async function iniciar() {
     const situacion = await api('/api/estado');
     estado.sinUsuarios = situacion.sin_usuarios;
     estado.registro = Boolean(situacion.registro);
+    estado.enlaces = situacion.enlaces || [];
     estado.usuario = situacion.usuario || estado.usuario;
     if (situacion.necesita_entrar) { mostrarEntrada(); return; }
   } catch (err) {

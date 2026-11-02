@@ -256,6 +256,37 @@ class DropIndex:
 
 
 @node
+class ArgProc(Expr):
+    """«:nombre»: un parámetro dentro del cuerpo de un procedimiento."""
+    name: str
+
+
+@node
+class CreateProcedure:
+    name: str
+    params: list
+    body: list
+    sql: str  # el cuerpo tal como se escribió
+
+
+@node
+class DropProcedure:
+    name: str
+    if_exists: bool = False
+
+
+@node
+class CallProcedure:
+    name: str
+    args: list
+
+
+@node
+class ShowProcedures:
+    pass
+
+
+@node
 class CreateView:
     name: str
     query: Any

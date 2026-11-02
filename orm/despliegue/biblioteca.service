@@ -1,0 +1,24 @@
+[Unit]
+Description=Biblioteca de ejemplo: SQLAlchemy sobre SBD
+After=network-online.target sbd.service
+Wants=network-online.target sbd.service
+
+[Service]
+Type=simple
+User=biblioteca
+WorkingDirectory=/srv/biblioteca
+# La clave de API de SBD: solo la lee systemd, al arrancar
+EnvironmentFile=/srv/biblioteca/entorno
+ExecStart=/srv/biblioteca/venv/bin/python3 -m biblioteca.web --sbd http://127.0.0.1:8090 --base biblioteca --puerto 8097
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=15
+# Endurecimiento: no escribe en ningún sitio, sus datos están en el servidor de SBD.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

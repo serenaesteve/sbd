@@ -14,6 +14,7 @@ de un diario viejo (si se cortó la luz justo al compactar) se ignoran, y una ú
 a medio escribir se descarta.
 Los cambios de estructura (crear tablas, añadir columnas…) siempre guardan la foto entera.
 """
+import errno
 import json
 import os
 import time
@@ -53,8 +54,10 @@ def _replace_name(text, old, new):
     """Sustituye el nombre «old» en el texto (salvo justo después de «como», que es el nombre de salida)."""
     out, last, previous = [], 0, None
     for tok in tokenize(text):
+        # Tras «:» viene un valor o un parámetro de procedimiento («:cantidad»), que no es un nombre de la base.
         if tok.type in ('word', 'ident') and tok.value == old and not (
-                previous is not None and previous.type == 'word' and previous.value == 'como'):
+                previous is not None and ((previous.type == 'word' and previous.value == 'como')
+                                          or (previous.type == 'op' and previous.value == ':'))):
             out.append(text[last:tok.pos])
             out.append(quote_ident(new))
             last = tok.end
@@ -83,11 +86,26 @@ def _infer_type(values):
     return None
 
 
+def sincronizar_carpeta(ruta):
+    """Hace duradero un nombre nuevo: un fsync del fichero guarda sus datos, no la entrada de la carpeta."""
+    if os.name == 'nt':
+        return  # Windows no abre carpetas así; allí os.replace ya pide escribirlo a disco
+    fd = os.open(os.path.dirname(os.path.abspath(ruta)), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    except OSError as e:
+        if e.errno not in (errno.EINVAL, errno.ENOTSUP):  # hay sistemas de ficheros que no lo admiten
+            raise
+    finally:
+        os.close(fd)
+
+
 class Database:
     def __init__(self, path=None, quien='Python'):
         self.path = None if path in (None, '', ':memory:') else os.fspath(path)
         self.tables = {}       # nombre -> Table
         self.views = {}        # nombre -> (sql, Select)
+        self.procedures = {}   # nombre -> CreateProcedure
         self.index_owner = {}  # nombre de índice -> nombre de tabla
         self.in_transaction = False
         self.loading = False
@@ -187,7 +205,13 @@ class Database:
         for t in self.tables.values():
             statements += [index.to_sbd(t.name) for index in t.indexes.values() if not index.auto]
         statements += [f"crear vista {quote_ident(name)} = {sql}" for name, (sql, _) in self.views.items()]
+        statements += [self.procedure_sbd(p) for p in self.procedures.values()]
         return statements
+
+    @staticmethod
+    def procedure_sbd(proc):
+        return (f"crear procedimiento {quote_ident(proc.name)}({', '.join(quote_ident(p) for p in proc.params)}) "
+                f"{{\n  {proc.sql}\n}}")
 
     def table(self, name):
         table = self.tables.get(name)
@@ -267,10 +291,10 @@ class Database:
             self._undo.pop()[0]()
 
     def _schema_checkpoint(self):
-        tables, views, owners = dict(self.tables), dict(self.views), dict(self.index_owner)
+        tables, views, owners, procedures = dict(self.tables), dict(self.views), dict(self.index_owner), dict(self.procedures)
 
         def undo():
-            self.tables, self.views, self.index_owner = tables, views, owners
+            self.tables, self.views, self.index_owner, self.procedures = tables, views, owners, procedures
         self._log(undo, ('ddl',))
 
     # ======================================================= cambios en filas
@@ -498,6 +522,38 @@ class Database:
         del self.views[stmt.name]
         return Result(message=f"Vista {stmt.name} borrada")
 
+    # ======================================================= procedimientos
+    def create_procedure(self, stmt):
+        if stmt.name in self.procedures:
+            raise SBDError(f"ya existe un procedimiento «{stmt.name}»: bórralo antes con «borrar procedimiento {stmt.name}»")
+        self._schema_checkpoint()
+        self.procedures[stmt.name] = stmt
+        return Result(message=f"Procedimiento {stmt.name} creado")
+
+    def drop_procedure(self, stmt):
+        if stmt.name not in self.procedures:
+            if stmt.if_exists:
+                return Result(message=f"El procedimiento {stmt.name} no existía; nada que borrar")
+            raise SBDError(f"no existe ningún procedimiento «{stmt.name}»")
+        self._schema_checkpoint()
+        del self.procedures[stmt.name]
+        return Result(message=f"Procedimiento {stmt.name} borrado")
+
+    def _procedures_using(self, name):
+        return [p.name for p in self.procedures.values()
+                if any(t.type in ('word', 'ident') and t.value == name for t in tokenize(p.sql))]
+
+    def _rewrite_procedures(self, old, new):
+        """Una tabla ha cambiado de nombre: lo cambia también en el cuerpo de los procedimientos."""
+        updated = []
+        for name in self._procedures_using(old):
+            proc = self.procedures[name]
+            sql = _replace_name(proc.sql, old, new)
+            definicion = self.procedure_sbd(replace(proc, sql=sql))
+            self.procedures[name] = Parser(definicion).parse_statement()
+            updated.append(name)
+        return updated
+
     # =========================================================== ALTER TABLE
     def alter_table(self, stmt, ex):
         table = self.table(stmt.table)
@@ -583,7 +639,9 @@ class Database:
         for index_name in renamed.indexes:
             self.index_owner[index_name] = new_name
         views = self._rewrite_views(self._views_using(old), old, new_name)
-        return Result(message=f"Tabla {old} renombrada a {new_name}" + _views_note(views))
+        procedures = self._rewrite_procedures(old, new_name)
+        note = f" · procedimientos actualizados: {', '.join(procedures)}" if procedures else ''
+        return Result(message=f"Tabla {old} renombrada a {new_name}" + _views_note(views) + note)
 
     def _alter_rename_column(self, table, stmt, ex):
         old, new_name = stmt.name, stmt.new_name
@@ -626,6 +684,9 @@ class Database:
         note = _views_note(views)
         if unsure:
             note += f" · revisa a mano: {', '.join(unsure)} (otra tabla de la vista tiene una columna «{old}»)"
+        procedures = self._procedures_using(old)
+        if procedures:
+            note += f" · revisa a mano los procedimientos: {', '.join(procedures)}"
         return Result(message=f"Columna {table.name}.{old} renombrada a {new_name}" + note)
 
     def _views_using(self, table_name):
@@ -664,10 +725,13 @@ class Database:
                 ops.append([r[0], r[1], r[2], [r[3][c] for c in self.tables[r[1]].colnames]])
         line = (json.dumps({'g': self.generation, 'ops': ops}, ensure_ascii=False,
                            default=json_por_defecto) + '\n').encode('utf-8')
+        nuevo = not os.path.exists(self.journal_path)
         with open(self.journal_path, 'ab') as f:
             f.write(line)
             f.flush()
             os.fsync(f.fileno())
+        if nuevo:
+            sincronizar_carpeta(self.journal_path)
         self._journal_bytes += len(line)
         if self._journal_bytes > COMPACT_MIN_BYTES and self._journal_bytes > self._snapshot_bytes:
             self._save()
@@ -697,6 +761,9 @@ class Database:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, self.path)
+        # El diario solo se borra cuando la foto nueva ya es segura. Si el corte llega antes, al abrir se ve
+        # la foto vieja con su diario, o la nueva con un diario de otra generación, que se ignora.
+        sincronizar_carpeta(self.path)
         self._snapshot_bytes = os.path.getsize(self.path)
         if os.path.exists(self.journal_path):
             os.remove(self.journal_path)

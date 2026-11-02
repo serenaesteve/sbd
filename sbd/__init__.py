@@ -14,7 +14,7 @@
 
     remota = sbd.conectar_servidor('https://datos.miweb.es', clave='sbd_…', base='tienda')
 """
-__version__ = '3.1.1'
+__version__ = '3.2.0'
 
 from .cliente import Cliente, ErrorServidor, conectar_servidor  # noqa: E402
 from .database import Database  # noqa: E402

@@ -38,7 +38,7 @@ from ..errors import BaseOcupada, IncompleteInputError, PermisoDenegado, SBDErro
 from ..functions import FUNCTIONS
 from ..importar import importar, leer_fichero
 from ..nodes import (AGGREGATES, WINDOW_ONLY, Describe, Explain, Import, Select, ShowDatabases, ShowIndexes,
-                     ShowTables, ShowUsers)
+                     ShowProcedures, ShowTables, ShowUsers)
 from ..parser import KEYWORDS, TYPES, Parser
 from ..servidor import Servidor, Sesion
 from ..storage import quote_ident
@@ -55,7 +55,7 @@ STATIC_FILES = {
 MAX_FILAS_PANEL = 2000
 MAX_BODY = 50 * 1024 * 1024
 LOCAL_HOSTS = {'localhost', '127.0.0.1', '[::1]'}
-READ_ONLY = (Select, ShowTables, ShowIndexes, Describe, ShowDatabases, ShowUsers, Explain)
+READ_ONLY = (Select, ShowTables, ShowIndexes, ShowProcedures, Describe, ShowDatabases, ShowUsers, Explain)
 DURACION_SESION_WEB = 12 * 3600
 DURACION_TRANSACCION = 120   # una transacción sin usar se deshace a los 2 minutos
 DURACION_SESION_API = 600    # una sesión de la API sin usar se cierra a los 10 minutos
@@ -121,6 +121,7 @@ class Nucleo:
         self._api = {}       # id de sesión -> {'usuario', 'base', 'ultima'}
         self._fallos = {}    # ip -> (intentos fallidos seguidos, bloqueado hasta)
         self._altas = []     # (momento, ip) de las cuentas creadas en la última hora
+        self.enlaces = []    # [{texto, url}]: otras páginas de esta web, para enlazarlas desde el panel
         self._ultima_copia = None
 
     # ------------------------------------------------------- mantenimiento
@@ -224,11 +225,12 @@ class Nucleo:
     def estado(self, testigo):
         registro = self.servidor.ajustes()['registro']
         if not self.servidor.hay_usuarios():
-            return {'sin_usuarios': True, 'usuario': None, 'registro': False}
+            return {'sin_usuarios': True, 'usuario': None, 'registro': False, 'enlaces': self.enlaces}
         try:
-            return {'sin_usuarios': False, 'usuario': self.usuario_web(testigo), 'registro': registro}
+            return {'sin_usuarios': False, 'usuario': self.usuario_web(testigo), 'registro': registro, 'enlaces': self.enlaces}
         except ApiError:
-            return {'sin_usuarios': False, 'usuario': None, 'necesita_entrar': True, 'registro': registro}
+            return {'sin_usuarios': False, 'usuario': None, 'necesita_entrar': True, 'registro': registro,
+                    'enlaces': self.enlaces}
 
     # ------------------------------------------------------- sesiones
     def _sesion(self, usuario, base=None, sid=None, **opciones):
@@ -279,7 +281,9 @@ class Nucleo:
                    'columnas': [{'nombre': c.name, 'tipo': c.type_sbd()} for c in t.columns]}
                   for t in db.tables.values()]
         return {'nombre': nombre, 'bytes': db.bytes_on_disk, **self._estado_base(sesion),
-                'tablas': sorted(tablas, key=lambda t: t['nombre']), 'vistas': sorted(db.views)}
+                'tablas': sorted(tablas, key=lambda t: t['nombre']), 'vistas': sorted(db.views),
+                'procedimientos': [{'nombre': p.name, 'parametros': p.params, 'definicion': db.procedure_sbd(p)}
+                                   for _, p in sorted(db.procedures.items())]}
 
     def catalogo(self, usuario, base, sid=None):
         sesion = self._sesion(usuario, base, sid)
@@ -455,6 +459,7 @@ class Nucleo:
                 lineas.append('')
         if not tabla:
             lineas += [f"crear vista {quote_ident(v)} = {sql}" for v, (sql, _) in db.views.items()]
+            lineas += [db.procedure_sbd(p) for p in db.procedures.values()]
         return '\n'.join(lineas) + '\n'
 
 
@@ -744,6 +749,8 @@ def main(argv=None):
     parser.add_argument('--proxy', default='', metavar='DOMINIOS',
                         help='está detrás de un proxy con HTTPS en este equipo que atiende estos dominios '
                              '(separados por comas): los acepta, y toma la IP real de X-Forwarded-For')
+    parser.add_argument('--enlace', action='append', default=[], metavar='TEXTO=/RUTA',
+                        help='otra página de esta web que enlazar desde el panel (se puede repetir)')
     parser.add_argument('--abrir', action='store_true', help='abre el navegador al arrancar')
     args = parser.parse_args(argv)
     dominios = [d.strip() for d in args.proxy.split(',') if d.strip()]
@@ -774,6 +781,14 @@ def main(argv=None):
         return 1
     esquema = 'https' if contexto else 'http'
     url = f"{esquema}://{'127.0.0.1' if args.host in ('0.0.0.0', '', '::') else args.host}:{args.puerto}"
+    for enlace in args.enlace:
+        texto, _, destino = enlace.partition('=')
+        if not texto or not destino.startswith('/'):
+            print(f"✕ --enlace necesita TEXTO=/RUTA, y esto no lo es: {enlace}", file=sys.stderr)
+            http.server_close()
+            servidor.cerrar()
+            return 1
+        http.nucleo.enlaces.append({'texto': texto, 'url': destino})
     ruta_info = escribir_fichero_servidor(servidor.directorio, url, http.nucleo.clave_local)
     http.nucleo.mantenimiento()
     http.mantener()

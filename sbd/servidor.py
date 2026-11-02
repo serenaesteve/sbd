@@ -18,20 +18,21 @@ import shutil
 import time
 
 from .cerrojo import Cerrojo
-from .database import Database
+from .database import Database, sincronizar_carpeta
 from .parser import Parser
 from .errors import PermisoDenegado, SBDError
-from .nodes import (AlterTable, Begin, ChangePassword, ChangePermission, Commit, CopyDatabase, CreateApiKey, CreateIndex,
+from .nodes import (AlterTable, Begin, CallProcedure, ChangePassword, ChangePermission, Commit, CopyDatabase, CreateApiKey, CreateIndex,
                     CreateTable, Explain, CreateDatabase, CreateUser, Describe, DropApiKey, DropDatabase, DropUser,
                     Import, Insert, RecoverDatabase, Rollback, Select, RestoreBackup, ShowApiKeys, ShowBackups,
-                    ShowDatabases, ShowHistory, ShowIndexes, ShowTables, ShowTrash, ShowUsers, Update, UseDatabase)
+                    ShowDatabases, ShowHistory, ShowIndexes, ShowProcedures, ShowTables, ShowTrash, ShowUsers, Update,
+                    UseDatabase)
 from .result import Result
 
 EXTENSION = '.base'
 _VALID_NAME = re.compile(r'[a-zñ_][a-z0-9ñ_]{0,62}\Z')
 PERMISOS = ('leer', 'escribir', 'todo')
-SOLO_LECTURA = (Select, ShowTables, ShowIndexes, Describe, ShowDatabases, UseDatabase, Begin, Commit, Rollback,
-                Explain)
+SOLO_LECTURA = (Select, ShowTables, ShowIndexes, ShowProcedures, Describe, ShowDatabases, UseDatabase, Begin, Commit,
+                Rollback, Explain)
 SIN_AUDITAR = SOLO_LECTURA + (ShowTrash, ShowUsers, ShowApiKeys, ShowBackups, ShowHistory)
 _CLAVE_EN_TEXTO = re.compile(r"""(\bclave\b(?:\s+de\s+\S+\s+a)?\s+)("(?:[^"]|"")*"|'(?:[^']|'')*')""", re.IGNORECASE)
 GESTION = (CreateDatabase, DropDatabase, RecoverDatabase, ShowTrash, CreateUser, DropUser, ChangePermission, ShowUsers,
@@ -41,7 +42,7 @@ MIN_CLAVE = 8
 CUENTA = 'cuenta'
 USUARIOS_PROPIOS = (CreateUser, DropUser, ChangePermission, ShowUsers)
 NUEVA_BASE = (CreateDatabase, CopyDatabase, RestoreBackup, RecoverDatabase)
-CRECE = (Insert, Update, CreateTable, CreateIndex, AlterTable, Import)  # lo que puede ocupar más memoria
+CRECE = (Insert, Update, CreateTable, CreateIndex, AlterTable, Import, CallProcedure)  # lo que puede ocupar más memoria
 AJUSTES = {'registro': False, 'max_bases': 10, 'max_mb': 100, 'max_filas': 250_000, 'max_memoria_mb': 6000}
 RESERVADOS = {'admin', 'administrador', 'root', 'sbd', 'sistema', 'soporte', 'todo', 'todas', 'nadie'}
 _EN_PAPELERA = re.compile(r'([a-zñ_][a-z0-9ñ_]*)-(\d{8}-\d{6})' + re.escape(EXTENSION) + r'\Z')
@@ -94,8 +95,11 @@ class Servidor:
         tmp = ruta + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump({campo: datos}, f, ensure_ascii=False, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
         os.chmod(tmp, 0o600)
         os.replace(tmp, ruta)
+        sincronizar_carpeta(ruta)
 
     # --------------------------------------------------------- claves de API
     def crear_clave_api(self, usuario, nombre=None):
@@ -145,11 +149,7 @@ class Servidor:
             return json.load(f).get('usuarios', {})
 
     def _guardar_usuarios(self):
-        tmp = self._ruta_usuarios + '.tmp'
-        with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump({'usuarios': self._usuarios}, f, ensure_ascii=False, indent=1)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, self._ruta_usuarios)
+        self._guardar_json(self._ruta_usuarios, 'usuarios', self._usuarios)
 
     @staticmethod
     def _resumen_clave(clave, sal):

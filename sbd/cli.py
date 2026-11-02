@@ -29,6 +29,8 @@ def servicio(argv):
     parser.add_argument('--clave-privada')
     parser.add_argument('--origenes', default='')
     parser.add_argument('--proxy', default='', metavar='DOMINIOS', help='dominios que atiende el proxy con HTTPS')
+    parser.add_argument('--enlace', action='append', default=[], metavar='TEXTO=/RUTA',
+                        help='otra página de esta web que enlazar desde el panel')
     parser.add_argument('--instalar', action='store_true',
                         help=f'escribe {UNIDAD} y lo arranca (necesita ser root)')
     args = parser.parse_args(argv)
@@ -44,6 +46,7 @@ def servicio(argv):
         opciones.append(f'--origenes {args.origenes}')
     if args.proxy:
         opciones.append(f'--proxy {args.proxy}')
+    opciones += [f'--enlace {e}' for e in args.enlace]
     escritura = [datos] + ([os.path.dirname(os.path.abspath(args.certificado))] if args.certificado else [])
     unidad = f"""[Unit]
 Description=SBD, servidor de bases de datos (panel y API)
