@@ -19,7 +19,8 @@ DOMINIO=sbd.serenaesteve.com
 DESTINO="$RAIZ/respaldos/$(date +%Y%m%d-%H%M%S)-antes-de-publicar-biblioteca"
 cd /srv/sbd
 
-bases() { sudo -u sbd "$SBD" "$DATOS" -e 'bases' 2>/dev/null | grep -v biblioteca | sed 's/ *$//'; }
+# El tamaño no cuenta: al parar, SBD pasa su diario al .base y ocupa menos con los mismos datos
+bases() { sudo -u sbd "$SBD" "$DATOS" -e 'bases' 2>/dev/null | grep -v biblioteca | awk -F'│' '{print $1 $2}' | sed 's/ *$//'; }
 
 echo "· 1/4 copia de seguridad"
 ANTES=$(bases)

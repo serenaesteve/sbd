@@ -411,6 +411,8 @@ Los errores llegan como excepción (`ErrorServidor`, `ErrorSBD`, `SBDException`)
 
 **Con un ORM:** la carpeta [orm/](orm/README.md) tiene un conector de SQLAlchemy (`create_engine("sbd:///datos/mi_base.base")` o, por un servidor, `"sbd+https://:CLAVE@datos.miweb.es/mi_base"`) y una biblioteca de ejemplo con su web. Traduce el SQL que genera SQLAlchemy a las órdenes de SBD; el lenguaje de SBD no cambia, y SBD sigue sin depender de nada, porque SQLAlchemy solo se instala con `pip install ./orm`.
 
+**Como base de objetos:** la carpeta [objetos/](objetos/README.md) tiene el Baúl, que guarda objetos de Python con su identidad, sus referencias y su herencia, en un fichero YAML o en SBD (`baul.abrir('sbd:///datos/objetos.base')`). En SBD, cada objeto es una fila con su YAML.
+
 **Sin servidor**, dentro del mismo programa (scripts, pruebas, herramientas de una persona):
 
 ```python
